@@ -5,9 +5,11 @@
 pub(crate) use self::crossoriginstoragemanager::CrossOriginStorageManager;
 pub(crate) use self::filesystemfilehandle::FileSystemFileHandle;
 pub(crate) use self::filesystemhandle::FileSystemHandle;
+pub(crate) use self::filesystemwritablefilestream::FileSystemWritableFileStream;
 
 pub(crate) mod crossoriginstoragemanager;
 pub(crate) mod filesystemfilehandle;
 pub(crate) mod filesystemhandle;
+pub(crate) mod filesystemwritablefilestream;
 pub(crate) mod hash;
 pub(crate) mod registry;

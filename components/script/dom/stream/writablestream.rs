@@ -171,7 +171,7 @@ pub struct WritableStream {
 
 impl WritableStream {
     /// <https://streams.spec.whatwg.org/#initialize-writable-stream>
-    fn new_inherited() -> WritableStream {
+    pub(crate) fn new_inherited() -> WritableStream {
         WritableStream {
             reflector_: Reflector::new(),
             backpressure: Default::default(),
@@ -960,20 +960,34 @@ impl WritableStream {
 }
 
 /// <https://streams.spec.whatwg.org/#create-writable-stream>
+///
+/// Split out from [`create_writable_stream`] so it can also be used by a
+/// type that subclasses `WritableStream` (e.g.
+/// `crossoriginstorage::filesystemwritablefilestream::FileSystemWritableFileStream`),
+/// which needs to reflect its own, more-derived struct in a single
+/// `reflect_dom_object_with_cx`-style call (the same pattern `File`/`Blob`
+/// use) rather than have `WritableStream` reflect itself standalone via
+/// [`WritableStream::new_with_proto`]. This function performs the *second*
+/// half of `create-writable-stream` -- controller construction and setup
+/// -- against a `WritableStream` the caller has already constructed
+/// (`WritableStream::new_inherited()`) and reflected as part of their own
+/// struct.
+///
+/// [`create_writable_stream`]'s own behavior is unchanged: it still
+/// constructs and reflects a plain `WritableStream` itself, then delegates
+/// to this function for the rest, in the same order as before this
+/// extraction.
 #[cfg_attr(crown, expect(crown::unrooted_must_root))]
-pub(crate) fn create_writable_stream(
+pub(crate) fn setup_writable_stream_default_controller_for(
     cx: &mut JSContext,
     global: &GlobalScope,
+    stream: &WritableStream,
     writable_high_water_mark: f64,
     writable_size_algorithm: Rc<QueuingStrategySize>,
     underlying_sink_type: UnderlyingSinkType,
-) -> Fallible<DomRoot<WritableStream>> {
+) -> Fallible<()> {
     // Assert: ! IsNonNegativeNumber(highWaterMark) is true.
     assert!(writable_high_water_mark >= 0.0);
-
-    // Let stream be a new WritableStream.
-    // Perform ! InitializeWritableStream(stream).
-    let stream = WritableStream::new_with_proto(cx, global, None);
 
     // Let controller be a new WritableStreamDefaultController.
     let controller = WritableStreamDefaultController::new(
@@ -986,7 +1000,30 @@ pub(crate) fn create_writable_stream(
 
     // Perform ? SetUpWritableStreamDefaultController(stream, controller, startAlgorithm, writeAlgorithm,
     // closeAlgorithm, abortAlgorithm, highWaterMark, sizeAlgorithm).
-    controller.setup(cx, global, &stream)?;
+    controller.setup(cx, global, stream)
+}
+
+/// <https://streams.spec.whatwg.org/#create-writable-stream>
+#[cfg_attr(crown, expect(crown::unrooted_must_root))]
+pub(crate) fn create_writable_stream(
+    cx: &mut JSContext,
+    global: &GlobalScope,
+    writable_high_water_mark: f64,
+    writable_size_algorithm: Rc<QueuingStrategySize>,
+    underlying_sink_type: UnderlyingSinkType,
+) -> Fallible<DomRoot<WritableStream>> {
+    // Let stream be a new WritableStream.
+    // Perform ! InitializeWritableStream(stream).
+    let stream = WritableStream::new_with_proto(cx, global, None);
+
+    setup_writable_stream_default_controller_for(
+        cx,
+        global,
+        &stream,
+        writable_high_water_mark,
+        writable_size_algorithm,
+        underlying_sink_type,
+    )?;
 
     // Return stream.
     Ok(stream)

@@ -8,12 +8,14 @@ use std::rc::Rc;
 
 use dom_struct::dom_struct;
 use js::context::JSContext;
+use js::conversions::{ConversionResult, FromJSValConvertible};
 use js::jsapi::{Heap, IsPromiseObject, JSObject};
 use js::jsval::{JSVal, UndefinedValue};
 use js::realm::CurrentRealm;
 use js::rust::{HandleObject as SafeHandleObject, HandleValue as SafeHandleValue, IntoHandle};
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 
+use crate::dom::bindings::buffer_source::{ArrayBufferViewOrArrayBufferRef, get_buffer_source_copy};
 use crate::dom::bindings::callback::ExceptionHandling;
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategySize;
 use crate::dom::bindings::codegen::Bindings::UnderlyingSinkBinding::{
@@ -21,6 +23,7 @@ use crate::dom::bindings::codegen::Bindings::UnderlyingSinkBinding::{
     UnderlyingSinkWriteCallback,
 };
 use crate::dom::bindings::codegen::Bindings::WritableStreamDefaultControllerBinding::WritableStreamDefaultControllerMethods;
+use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer;
 use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
@@ -297,18 +300,10 @@ pub enum UnderlyingSinkType {
     /// are implemented in Rust. This is the first genuinely native
     /// (non-`Js`, non-`Transfer`) sink variant added since `Transform`;
     /// see `crossoriginstorage::filesystemwritablefilestream` for the
-    /// caller.
-    ///
-    /// Note: this variant alone is not sufficient to make
-    /// `FileSystemWritableFileStream : WritableStream` constructible.
-    /// `WritableStream`'s own constructors
-    /// (`WritableStream::new_inherited` and `create_writable_stream`) are
-    /// not currently structured to support being composed into a subclass
-    /// the way e.g. `Blob`/`File` are -- `create_writable_stream` reflects
-    /// a standalone `WritableStream` object itself, rather than leaving
-    /// reflection to an outer, more-derived type. See
-    /// `crossoriginstorage/filesystemwritablefilestream.rs` (not yet
-    /// added) for what that would require.
+    /// caller, which composes a `WritableStream` in and reflects itself
+    /// (the same pattern `File`/`Blob` use), via
+    /// `writablestream::setup_writable_stream_default_controller_for`
+    /// (added alongside this variant specifically to support that).
     CrossOriginStorageWrite {
         #[no_trace]
         hash: crate::dom::crossoriginstorage::hash::CosHash,
@@ -769,32 +764,45 @@ impl WritableStreamDefaultController {
                     .transform_stream_default_sink_write_algorithm(cx, global, chunk)
                     .expect("Transform stream default sink write algorithm should not fail.")
             },
-            UnderlyingSinkType::CrossOriginStorageWrite { .. } => {
-                // NOT YET IMPLEMENTED. `chunk` here is an arbitrary,
-                // already-dequeued internal `SafeHandleValue` -- this is
-                // deep algorithm-internal code, not a WebIDL-annotated
-                // method, so there is no automatic argument conversion
-                // available. Converting it into bytes (the realistic case
-                // being an ArrayBuffer/ArrayBufferView, per
-                // FileSystemWriteChunkType) needs to go through the same
-                // `FromJSValConvertible` machinery WebIDL codegen
-                // generates for union types, called manually. I could not
-                // find an existing precedent anywhere in this codebase for
-                // calling that conversion manually, outside of
-                // argument-binding position, and did not want to guess at
-                // unsafe-adjacent JS interop code with no way to verify it
-                // here. This is the single most important remaining piece
-                // of the Cross-Origin Storage write path; every other
-                // native-sink algorithm arm above (start, abort, close)
-                // is implemented for real.
+            UnderlyingSinkType::CrossOriginStorageWrite { bytes, .. } => {
+                // <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-write>
+                // (the ArrayBuffer/ArrayBufferView case of
+                // FileSystemWriteChunkType only; Blob, USVString, and
+                // WriteParams chunks are not yet supported -- see below).
+                //
+                // `chunk` is an arbitrary, already-dequeued internal
+                // value here, not a WebIDL method argument, so there is
+                // no automatic conversion. `ArrayBufferViewOrArrayBuffer`
+                // is a codegen'd union type, and -- like every codegen'd
+                // union type -- implements `FromJSValConvertible`
+                // (js::conversions), which is a plain trait method
+                // callable manually, not only from generated
+                // argument-binding code. Pattern for the three-way
+                // Result<ConversionResult<T>, ()> match confirmed against
+                // dom/bindings/conversions.rs's own use of the same API.
                 let promise = Promise::new(cx, global);
-                promise.reject_error(
-                    cx,
-                    Error::NotSupported(Some(
-                        "Cross-Origin Storage write() chunk handling is not yet implemented"
-                            .to_owned(),
-                    )),
-                );
+                match ArrayBufferViewOrArrayBuffer::safe_from_jsval(cx, chunk, ()) {
+                    Ok(ConversionResult::Success(buffer_source)) => {
+                        let chunk_bytes = get_buffer_source_copy(
+                            ArrayBufferViewOrArrayBufferRef::from(&buffer_source),
+                        );
+                        bytes.borrow_mut().extend_from_slice(&chunk_bytes);
+                        promise.resolve_native(cx, &());
+                    },
+                    Ok(ConversionResult::Failure(_)) => {
+                        promise.reject_error(
+                            cx,
+                            Error::Type(
+                                c"Cross-Origin Storage writable streams currently only accept \
+                                  ArrayBuffer or ArrayBufferView chunks"
+                                    .to_owned(),
+                            ),
+                        );
+                    },
+                    Err(()) => {
+                        promise.reject_error(cx, Error::JSFailed);
+                    },
+                }
                 promise
             },
         }
