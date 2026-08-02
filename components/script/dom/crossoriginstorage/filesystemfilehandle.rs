@@ -17,23 +17,21 @@
 //! A handle is one of two shapes, matching the two ways
 //! `CrossOriginStorageManager::RequestFileHandle` can produce one:
 //! - `Backing::Read`: from a successful read (`options.create` unset or
-//!   false). Carries the already-fetched entry bytes; `getFile()` works,
-//!   `createWritable()` currently does not (see below).
+//!   false). Carries the already-fetched entry bytes, so `getFile()`
+//!   resolves from them directly with no further IPC.
 //! - `Backing::Create`: from a create request (`options.create: true`).
 //!   Carries the hash, requesting origin, and requested `origins` value
-//!   needed to later call `registry::verify_and_store` when the resulting
-//!   writable stream is closed; `createWritable()` works, `getFile()`
-//!   currently does not.
+//!   needed both to call `registry::verify_and_store` when the resulting
+//!   writable stream is closed, and (see `GetFile()` below) to do a fresh
+//!   registry read lookup for the same hash if `getFile()` is called on
+//!   this handle.
 //!
-//! Simplification: the real spec allows `getFile()` on a handle from
-//! `storing origins` regardless of how it was obtained, and
-//! `createWritable()` on any handle whose caller has write rights, not
-//! just ones from a `create: true` request. Supporting both operations on
-//! both handle shapes would need the handle to carry both a read result
-//! and enough write context unconditionally, which the registry's current
-//! API does not cleanly support yet. This covers the primary, realistic
-//! use of each: read a handle to read a file, request a create handle to
-//! write one.
+//! `createWritable()` still only works on a `Backing::Create` handle, not
+//! a `Backing::Read` one: the real spec allows `createWritable()` on any
+//! handle whose caller has write rights, not just ones from a
+//! `create: true` request, but supporting that would need a `Backing::Read`
+//! handle to carry write-rights context (`requested_origins`) it does not
+//! currently have, which is a real, if narrower, remaining gap.
 
 use std::rc::Rc;
 use std::time::SystemTime;
@@ -56,7 +54,7 @@ use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::crossoriginstorage::filesystemhandle::FileSystemHandle;
 use crate::dom::crossoriginstorage::filesystemwritablefilestream::FileSystemWritableFileStream;
 use crate::dom::crossoriginstorage::hash::CosHash;
-use crate::dom::crossoriginstorage::registry::{EntryBytes, RequestedOrigins};
+use crate::dom::crossoriginstorage::registry::{self, EntryBytes, RequestedOrigins};
 use crate::dom::file::File;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
@@ -141,39 +139,53 @@ impl FileSystemFileHandle {
 impl FileSystemFileHandleMethods<crate::DomTypeHolder> for FileSystemFileHandle {
     /// <https://fs.spec.whatwg.org/#dom-filesystemfilehandle-getfile>
     ///
-    /// Simplified relative to the full File System Standard algorithm:
-    /// that algorithm round-trips through an I/O task queue because a
-    /// general handle can be backed by disk I/O with real latency and
-    /// failure modes. Our registry is an in-memory `HashMap` lookup that
-    /// cannot meaningfully fail, so this resolves synchronously instead of
-    /// queuing a task.
+    /// On a `Backing::Read` handle, this is simplified relative to the
+    /// full File System Standard algorithm: that algorithm round-trips
+    /// through an I/O task queue because a general handle can be backed
+    /// by disk I/O with real latency and failure modes, but the bytes are
+    /// already in hand here, so this resolves synchronously instead of
+    /// queuing a task. On a `Backing::Create` handle there genuinely is
+    /// an IPC round-trip (a fresh registry read lookup for this handle's
+    /// hash), so that branch resolves/rejects asynchronously; see
+    /// `registry::complete_a_read_request_for_file`.
     fn GetFile(&self, realm: &mut CurrentRealm) -> Rc<Promise> {
         let promise = Promise::new_in_realm(realm);
 
-        let Backing::Read(entry) = &self.backing else {
-            // See this module's doc comment: getFile() on a create-mode
-            // handle is not yet supported.
-            promise.reject_error(
-                realm,
-                Error::NotSupported(Some(
-                    "getFile() on a handle obtained via options.create is not yet supported"
-                        .to_owned(),
-                )),
-            );
-            return promise;
-        };
+        match &self.backing {
+            Backing::Read(entry) => {
+                let blob_impl =
+                    BlobImpl::new_from_bytes(entry.bytes.clone(), entry.type_string.clone());
+                let name = DOMString::from(self.file_system_handle.name().to_string());
+                let file = File::new(
+                    realm,
+                    &self.file_system_handle.global(),
+                    blob_impl,
+                    name,
+                    Some(SystemTime::now()),
+                );
+                promise.resolve_native(realm, &file);
+            },
+            Backing::Create { hash, origin, .. } => {
+                // Per spec, getFile() works on any handle from a storing
+                // origin regardless of how it was obtained: a
+                // create-backed handle whose write has already completed
+                // (state Written) should read back the same as a fresh
+                // read-backed handle would; one whose write has not
+                // completed yet (state Pending) rejects with
+                // NotAllowedError, same as a fresh
+                // requestFileHandle() would for a pending entry.
+                let global = self.file_system_handle.global();
+                registry::complete_a_read_request_for_file(
+                    &global,
+                    hash,
+                    origin,
+                    &promise,
+                    global.task_manager().file_reading_task_source().to_sendable(),
+                    self.file_system_handle.name(),
+                );
+            },
+        }
 
-        let blob_impl = BlobImpl::new_from_bytes(entry.bytes.clone(), entry.type_string.clone());
-        let name = DOMString::from(self.file_system_handle.name().to_string());
-        let file = File::new(
-            realm,
-            &self.file_system_handle.global(),
-            blob_impl,
-            name,
-            Some(SystemTime::now()),
-        );
-
-        promise.resolve_native(realm, &file);
         promise
     }
 

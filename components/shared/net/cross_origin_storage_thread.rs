@@ -13,7 +13,7 @@
 //! and `net` cannot depend on `script`.
 
 use serde::{Deserialize, Serialize};
-use servo_base::generic_channel::GenericSender;
+use servo_base::generic_channel::GenericCallback;
 use servo_url::ImmutableOrigin;
 
 /// A COS hash, per
@@ -108,19 +108,23 @@ pub enum CosReadOutcome {
 /// `CoreResourceMsg::ToFileManager(FileManagerThreadMsg)`.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CosThreadMsg {
-    /// `complete a read request`.
-    Read(CosHash, ImmutableOrigin, GenericSender<CosReadOutcome>),
+    /// `complete a read request`. Answered via a `GenericCallback` so the
+    /// calling script thread never blocks on the response; see
+    /// `script::dom::crossoriginstorage::registry`'s doc comment for why
+    /// that matters.
+    Read(CosHash, ImmutableOrigin, GenericCallback<CosReadOutcome>),
     /// `complete a create request` (registry half only).
     Create(CosHash, Option<RequestedOrigins>),
     /// `verify and store`. The response is `Ok(())` on success, `Err(())`
-    /// on hash mismatch (caller should reject with `DataError`).
+    /// on hash mismatch (caller should reject with `DataError`). Same
+    /// `GenericCallback` reasoning as `Read` above.
     VerifyAndStore(
         CosHash,
         Vec<u8>,
         String,
         ImmutableOrigin,
         Option<RequestedOrigins>,
-        GenericSender<Result<(), ()>>,
+        GenericCallback<Result<(), ()>>,
     ),
 }
 

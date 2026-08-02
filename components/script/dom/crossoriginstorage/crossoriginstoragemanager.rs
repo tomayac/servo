@@ -4,7 +4,7 @@
 
 //! <https://wicg.github.io/cross-origin-storage/#the-crossoriginstoragemanager-interface>
 //!
-//! `requestFileHandle()` now implements both the read path and the create
+//! `requestFileHandle()` implements both the read path and the create
 //! path end to end, including the `origins` option (`validate a COS
 //! request` step 3), by delegating to `registry.rs` and constructing
 //! either a read- or create-backed `FileSystemFileHandle` (see
@@ -42,7 +42,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::crossoriginstorage::filesystemfilehandle::FileSystemFileHandle;
 use crate::dom::crossoriginstorage::hash::CosHash;
-use crate::dom::crossoriginstorage::registry::{self, ReadOutcome, RequestedOrigins};
+use crate::dom::crossoriginstorage::registry::{self, RequestedOrigins};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 
@@ -117,7 +117,7 @@ impl CrossOriginStorageManagerMethods<crate::DomTypeHolder> for CrossOriginStora
     /// <https://wicg.github.io/cross-origin-storage/#dom-crossoriginstoragemanager-requestfilehandle>
     ///
     /// See this module's doc comment for what is and is not yet
-    /// implemented. Resolves/rejects synchronously rather than via the
+    /// implemented. Resolves/rejects via a queued task rather than the
     /// spec's Cross-Origin Storage queue; see `registry.rs`'s doc comment
     /// for what that does and does not mean in this implementation.
     fn RequestFileHandle(
@@ -168,20 +168,16 @@ impl CrossOriginStorageManagerMethods<crate::DomTypeHolder> for CrossOriginStora
             return promise;
         }
 
-        // `complete a read request`.
-        match registry::complete_a_read_request(&self.global(), &cos_hash, &origin) {
-            ReadOutcome::Found(entry) => {
-                let handle =
-                    FileSystemFileHandle::new_for_read(realm, &self.global(), name, entry);
-                promise.resolve_native(realm, &handle);
-            },
-            ReadOutcome::NotFound => {
-                promise.reject_error(realm, Error::NotFound(None));
-            },
-            ReadOutcome::PendingWrite => {
-                promise.reject_error(realm, Error::NotAllowed(None));
-            },
-        }
+        // `complete a read request`. Resolves/rejects `promise`
+        // asynchronously; see `registry.rs`'s doc comment.
+        registry::complete_a_read_request(
+            &self.global(),
+            &cos_hash,
+            &origin,
+            &promise,
+            self.global().task_manager().file_reading_task_source().to_sendable(),
+            name,
+        );
 
         promise
     }

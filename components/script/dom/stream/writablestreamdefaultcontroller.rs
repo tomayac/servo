@@ -24,6 +24,7 @@ use crate::dom::bindings::codegen::Bindings::UnderlyingSinkBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::WritableStreamDefaultControllerBinding::WritableStreamDefaultControllerMethods;
 use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer;
+use crate::dom::bindings::conversions::root_from_handlevalue;
 use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
@@ -33,7 +34,7 @@ use crate::dom::promise::Promise;
 use crate::dom::promisenativehandler::{Callback, PromiseNativeHandler};
 use crate::dom::readablestreamdefaultcontroller::{EnqueuedValue, QueueWithSizes, ValueWithSize};
 use crate::dom::stream::writablestream::WritableStream;
-use crate::dom::types::{AbortController, AbortSignal, TransformStream};
+use crate::dom::types::{AbortController, AbortSignal, Blob, TransformStream};
 use crate::realms::enter_auto_realm;
 
 impl js::gc::Rootable for CloseAlgorithmFulfillmentHandler {}
@@ -766,9 +767,9 @@ impl WritableStreamDefaultController {
             },
             UnderlyingSinkType::CrossOriginStorageWrite { bytes, .. } => {
                 // <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-write>
-                // (the ArrayBuffer/ArrayBufferView case of
-                // FileSystemWriteChunkType only; Blob, USVString, and
-                // WriteParams chunks are not yet supported -- see below).
+                // (the ArrayBuffer/ArrayBufferView and Blob cases of
+                // FileSystemWriteChunkType; USVString and WriteParams
+                // chunks are still not supported.)
                 //
                 // `chunk` is an arbitrary, already-dequeued internal
                 // value here, not a WebIDL method argument, so there is
@@ -780,6 +781,17 @@ impl WritableStreamDefaultController {
                 // argument-binding code. Pattern for the three-way
                 // Result<ConversionResult<T>, ()> match confirmed against
                 // dom/bindings/conversions.rs's own use of the same API.
+                //
+                // A chunk that isn't a BufferSource is tried as a `Blob`
+                // next, via `root_from_handlevalue`, the same manual
+                // DOM-object-from-`HandleValue` downcast `indexeddb.rs`
+                // already uses for exactly this "arbitrary internal value,
+                // might be a Blob" situation. `Blob::get_bytes()` is
+                // synchronous because in-memory `Blob`s (as constructed by
+                // `new Blob([...])`, which is what every real caller of
+                // this write path uses) already have their bytes resident;
+                // it is not a general "read arbitrary Blob contents"
+                // primitive.
                 let promise = Promise::new(cx, global);
                 match ArrayBufferViewOrArrayBuffer::safe_from_jsval(cx, chunk, ()) {
                     Ok(ConversionResult::Success(buffer_source)) => {
@@ -789,15 +801,30 @@ impl WritableStreamDefaultController {
                         bytes.borrow_mut().extend_from_slice(&chunk_bytes);
                         promise.resolve_native(cx, &());
                     },
-                    Ok(ConversionResult::Failure(_)) => {
-                        promise.reject_error(
-                            cx,
-                            Error::Type(
-                                c"Cross-Origin Storage writable streams currently only accept \
-                                  ArrayBuffer or ArrayBufferView chunks"
-                                    .to_owned(),
-                            ),
-                        );
+                    Ok(ConversionResult::Failure(_)) => match root_from_handlevalue::<Blob>(cx, chunk)
+                    {
+                        Ok(blob) => match blob.get_bytes() {
+                            Ok(blob_bytes) => {
+                                bytes.borrow_mut().extend_from_slice(&blob_bytes);
+                                promise.resolve_native(cx, &());
+                            },
+                            Err(()) => {
+                                promise.reject_error(
+                                    cx,
+                                    Error::Type(c"Failed to read Blob contents".to_owned()),
+                                );
+                            },
+                        },
+                        Err(()) => {
+                            promise.reject_error(
+                                cx,
+                                Error::Type(
+                                    c"Cross-Origin Storage writable streams currently only \
+                                      accept ArrayBuffer, ArrayBufferView, or Blob chunks"
+                                        .to_owned(),
+                                ),
+                            );
+                        },
                     },
                     Err(()) => {
                         promise.reject_error(cx, Error::JSFailed);
@@ -860,26 +887,24 @@ impl WritableStreamDefaultController {
                 requested_origins,
             } => {
                 // <https://wicg.github.io/cross-origin-storage/#verify-and-store>
+                // Resolves/rejects `promise` asynchronously once the
+                // resource thread responds (including, for a large write,
+                // the time it takes to write the bytes to disk) rather
+                // than blocking this script thread on it; see
+                // `registry.rs`'s doc comment for why that matters.
                 let promise = Promise::new(cx, global);
                 let written_bytes = bytes.borrow_mut().split_off(0);
                 let requested = requested_origins.borrow_mut().take();
-                match crate::dom::crossoriginstorage::registry::verify_and_store(
+                crate::dom::crossoriginstorage::registry::verify_and_store(
                     global,
                     hash,
                     written_bytes,
                     type_string.clone(),
                     origin.clone(),
                     requested,
-                ) {
-                    Ok(()) => promise.resolve_native(cx, &()),
-                    Err(()) => {
-                        // Step 2: reject with DataError, leaving the entry
-                        // unmodified. `verify_and_store` already only
-                        // mutates the registry on the success path, so
-                        // there is nothing further to roll back here.
-                        promise.reject_error(cx, Error::Data(None));
-                    },
-                }
+                    &promise,
+                    global.task_manager().file_reading_task_source().to_sendable(),
+                );
                 promise
             },
         }
@@ -1021,6 +1046,31 @@ impl WritableStreamDefaultController {
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-default-controller-get-desired-size>
+    /// Resize the accumulated write buffer of a `CrossOriginStorageWrite`
+    /// sink directly, for `FileSystemWritableFileStream::Truncate()`. Not a
+    /// spec algorithm: the real `FileSystemWritableFileStream.truncate()`
+    /// routes through the same underlying-sink write algorithm as
+    /// `write()`/`seek()` (as a `WriteParams`-shaped chunk), which this
+    /// sink does not model. Bypassing the write-queue like this means a
+    /// `truncate()` racing a concurrent queued `write()` is not ordered
+    /// the way the spec requires; acceptable for this sink given nothing
+    /// in this codebase issues concurrent writes against one handle.
+    ///
+    /// # Panics
+    /// If `self`'s underlying sink is not `CrossOriginStorageWrite`. Only
+    /// call this on a controller known to back a
+    /// `FileSystemWritableFileStream`.
+    pub(crate) fn cross_origin_storage_truncate(&self, size: usize) {
+        match &self.underlying_sink_type {
+            UnderlyingSinkType::CrossOriginStorageWrite { bytes, .. } => {
+                bytes.borrow_mut().resize(size, 0);
+            },
+            _ => unreachable!(
+                "cross_origin_storage_truncate called on a non-CrossOriginStorageWrite sink"
+            ),
+        }
+    }
+
     pub(crate) fn get_desired_size(&self) -> f64 {
         // Return controller.[[strategyHWM]] − controller.[[queueTotalSize]].
         let desired_size = self.strategy_hwm - self.queue.total_size.get().clamp(0.0, f64::MAX);

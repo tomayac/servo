@@ -4,15 +4,18 @@
 
 // https://fs.spec.whatwg.org/#filesystemwritablefilestream
 //
-// NOTE: this is a minimal, Cross-Origin-Storage-scoped subset. Adds no
-// members of its own on top of WritableStream. See
-// crossoriginstorage/filesystemwritablefilestream.rs for the scope
-// rationale, including why that's not a functional gap: writing and
-// closing both work via the inherited WritableStream API already.
+// NOTE: this is a minimal, Cross-Origin-Storage-scoped subset. See
+// crossoriginstorage/filesystemwritablefilestream.rs for exactly what
+// write()/seek()/truncate() do and do not implement (in particular:
+// write() accepts BufferSource or Blob, not USVString or WriteParams;
+// seek() does not affect where a later write() lands).
 //
-// Deliberately omitted: write(), seek(), truncate(), close() convenience
-// methods.
+// Deliberately omitted: close() convenience method -- the inherited
+// WritableStream.close() already works unmodified.
 
 [Exposed=(Window,Worker), SecureContext, Pref="dom_cross_origin_storage_enabled"]
 interface FileSystemWritableFileStream : WritableStream {
+  [NewObject] Promise<undefined> write(any data);
+  [NewObject] Promise<undefined> seek([EnforceRange] unsigned long long position);
+  [NewObject] Promise<undefined> truncate([EnforceRange] unsigned long long size);
 };
