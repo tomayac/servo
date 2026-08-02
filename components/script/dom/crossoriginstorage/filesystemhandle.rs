@@ -14,7 +14,9 @@ use dom_struct::dom_struct;
 use js::context::JSContext;
 use script_bindings::reflector::{Reflector, reflect_dom_object_with_cx};
 
-use crate::dom::bindings::codegen::Bindings::FileSystemHandleBinding::FileSystemHandleKind;
+use crate::dom::bindings::codegen::Bindings::FileSystemHandleBinding::{
+    FileSystemHandleKind, FileSystemHandleMethods,
+};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
@@ -55,5 +57,17 @@ impl FileSystemHandle {
 
     pub(crate) fn name(&self) -> USVString {
         self.name.clone()
+    }
+}
+
+impl FileSystemHandleMethods<crate::DomTypeHolder> for FileSystemHandle {
+    /// <https://fs.spec.whatwg.org/#dom-filesystemhandle-kind>
+    fn Kind(&self) -> FileSystemHandleKind {
+        self.kind()
+    }
+
+    /// <https://fs.spec.whatwg.org/#dom-filesystemhandle-name>
+    fn Name(&self) -> USVString {
+        self.name()
     }
 }

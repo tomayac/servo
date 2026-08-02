@@ -307,9 +307,9 @@ pub enum UnderlyingSinkType {
     CrossOriginStorageWrite {
         #[no_trace]
         hash: crate::dom::crossoriginstorage::hash::CosHash,
-        #[no_trace]
+        #[no_trace = "Vec<u8> and RefCell hold no JS-managed data"]
         bytes: RefCell<Vec<u8>>,
-        #[no_trace]
+        #[no_trace = "String holds no JS-managed data"]
         type_string: String,
         #[no_trace]
         origin: servo_url::ImmutableOrigin,

@@ -8,4 +8,4 @@
 //! existing `crate::dom::crossoriginstorage::hash::CosHash` references
 //! elsewhere in this module tree keep working unchanged.
 
-pub(crate) use net_traits::cross_origin_storage_thread::{CosHash, CosHashValidationError};
+pub(crate) use net_traits::cross_origin_storage_thread::CosHash;

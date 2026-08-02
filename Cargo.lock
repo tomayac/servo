@@ -8679,6 +8679,7 @@ dependencies = [
  "async-compression",
  "async-recursion",
  "async-tungstenite",
+ "aws-lc-rs",
  "base64",
  "bytes",
  "chrono",

@@ -74,6 +74,7 @@ enum Backing {
 pub(crate) struct FileSystemFileHandle {
     file_system_handle: FileSystemHandle,
     #[no_trace]
+    #[ignore_malloc_size_of = "Not yet measured"]
     backing: Backing,
 }
 

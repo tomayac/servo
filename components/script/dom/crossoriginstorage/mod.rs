@@ -3,9 +3,6 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 pub(crate) use self::crossoriginstoragemanager::CrossOriginStorageManager;
-pub(crate) use self::filesystemfilehandle::FileSystemFileHandle;
-pub(crate) use self::filesystemhandle::FileSystemHandle;
-pub(crate) use self::filesystemwritablefilestream::FileSystemWritableFileStream;
 
 pub(crate) mod crossoriginstoragemanager;
 pub(crate) mod filesystemfilehandle;

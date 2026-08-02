@@ -16,9 +16,9 @@
 // crossoriginstorage/stub_registry.rs for exactly what that does and does
 // not implement.
 
-[SecureContext, Pref="dom_cross_origin_storage_enabled"]
+[SecureContext]
 interface mixin NavigatorCrossOriginStorage {
-  [SameObject, SecureContext] readonly attribute CrossOriginStorageManager crossOriginStorage;
+  [SameObject, Pref="dom_cross_origin_storage_enabled"] readonly attribute CrossOriginStorageManager crossOriginStorage;
 };
 Navigator includes NavigatorCrossOriginStorage;
 WorkerNavigator includes NavigatorCrossOriginStorage;
