@@ -292,6 +292,35 @@ pub enum UnderlyingSinkType {
     },
     /// Algorithms supporting transform streams are implemented in Rust.
     Transform(Dom<TransformStream>, Rc<Promise>),
+    /// Algorithms supporting Cross-Origin Storage's write path
+    /// (<https://wicg.github.io/cross-origin-storage/#creating-and-writing-files>)
+    /// are implemented in Rust. This is the first genuinely native
+    /// (non-`Js`, non-`Transfer`) sink variant added since `Transform`;
+    /// see `crossoriginstorage::filesystemwritablefilestream` for the
+    /// caller.
+    ///
+    /// Note: this variant alone is not sufficient to make
+    /// `FileSystemWritableFileStream : WritableStream` constructible.
+    /// `WritableStream`'s own constructors
+    /// (`WritableStream::new_inherited` and `create_writable_stream`) are
+    /// not currently structured to support being composed into a subclass
+    /// the way e.g. `Blob`/`File` are -- `create_writable_stream` reflects
+    /// a standalone `WritableStream` object itself, rather than leaving
+    /// reflection to an outer, more-derived type. See
+    /// `crossoriginstorage/filesystemwritablefilestream.rs` (not yet
+    /// added) for what that would require.
+    CrossOriginStorageWrite {
+        #[no_trace]
+        hash: crate::dom::crossoriginstorage::hash::CosHash,
+        #[no_trace]
+        bytes: RefCell<Vec<u8>>,
+        #[no_trace]
+        type_string: String,
+        #[no_trace]
+        origin: servo_url::ImmutableOrigin,
+        #[no_trace]
+        requested_origins: RefCell<Option<crate::dom::crossoriginstorage::registry::RequestedOrigins>>,
+    },
 }
 
 impl UnderlyingSinkType {
@@ -427,6 +456,12 @@ impl WritableStreamDefaultController {
                 backpressure_promise.borrow_mut().take();
             },
             UnderlyingSinkType::Transform(_, _) => {
+                return;
+            },
+            UnderlyingSinkType::CrossOriginStorageWrite { .. } => {
+                // Nothing to clear: there are no stored `Rc<Callback>`
+                // closures for a native sink, matching Transform's
+                // reasoning above.
                 return;
             },
         }
@@ -566,6 +601,13 @@ impl WritableStreamDefaultController {
                 // Let startAlgorithm be an algorithm that returns startPromise.
                 Ok(start_promise.clone())
             },
+            UnderlyingSinkType::CrossOriginStorageWrite { .. } => {
+                // Let startAlgorithm be an algorithm that returns undefined.
+                // There is no async setup step for a COS write (the
+                // registry's `complete a create request` already ran
+                // synchronously before this stream was constructed).
+                Ok(Promise::new_resolved(cx, global, ()))
+            },
         }
     }
 
@@ -628,6 +670,20 @@ impl WritableStreamDefaultController {
                 stream
                     .transform_stream_default_sink_abort_algorithm(cx, global, reason)
                     .expect("Transform stream default sink abort algorithm should not fail.")
+            },
+            UnderlyingSinkType::CrossOriginStorageWrite { bytes, .. } => {
+                // Discard accumulated bytes; verify_and_store is
+                // deliberately not called on abort, so no entry is
+                // written. Note: if `complete a create request` already
+                // created a Pending registry entry for this hash (see
+                // crossoriginstoragemanager.rs), that entry is left
+                // dangling in the Pending state -- this registry has no
+                // eviction/cleanup for abandoned pending entries. A real
+                // implementation should address this, e.g. by removing a
+                // still-Pending entry with no other in-flight writer on
+                // abort.
+                bytes.borrow_mut().clear();
+                Promise::new_resolved(cx, global, ())
             },
         };
 
@@ -713,6 +769,34 @@ impl WritableStreamDefaultController {
                     .transform_stream_default_sink_write_algorithm(cx, global, chunk)
                     .expect("Transform stream default sink write algorithm should not fail.")
             },
+            UnderlyingSinkType::CrossOriginStorageWrite { .. } => {
+                // NOT YET IMPLEMENTED. `chunk` here is an arbitrary,
+                // already-dequeued internal `SafeHandleValue` -- this is
+                // deep algorithm-internal code, not a WebIDL-annotated
+                // method, so there is no automatic argument conversion
+                // available. Converting it into bytes (the realistic case
+                // being an ArrayBuffer/ArrayBufferView, per
+                // FileSystemWriteChunkType) needs to go through the same
+                // `FromJSValConvertible` machinery WebIDL codegen
+                // generates for union types, called manually. I could not
+                // find an existing precedent anywhere in this codebase for
+                // calling that conversion manually, outside of
+                // argument-binding position, and did not want to guess at
+                // unsafe-adjacent JS interop code with no way to verify it
+                // here. This is the single most important remaining piece
+                // of the Cross-Origin Storage write path; every other
+                // native-sink algorithm arm above (start, abort, close)
+                // is implemented for real.
+                let promise = Promise::new(cx, global);
+                promise.reject_error(
+                    cx,
+                    Error::NotSupported(Some(
+                        "Cross-Origin Storage write() chunk handling is not yet implemented"
+                            .to_owned(),
+                    )),
+                );
+                promise
+            },
         }
     }
 
@@ -759,6 +843,35 @@ impl WritableStreamDefaultController {
                 stream
                     .transform_stream_default_sink_close_algorithm(cx, global)
                     .expect("Transform stream default sink close algorithm should not fail.")
+            },
+            UnderlyingSinkType::CrossOriginStorageWrite {
+                hash,
+                bytes,
+                type_string,
+                origin,
+                requested_origins,
+            } => {
+                // <https://wicg.github.io/cross-origin-storage/#verify-and-store>
+                let promise = Promise::new(cx, global);
+                let written_bytes = bytes.borrow_mut().split_off(0);
+                let requested = requested_origins.borrow_mut().take();
+                match crate::dom::crossoriginstorage::registry::verify_and_store(
+                    hash,
+                    written_bytes,
+                    type_string.clone(),
+                    origin.clone(),
+                    requested,
+                ) {
+                    Ok(()) => promise.resolve_native(cx, &()),
+                    Err(()) => {
+                        // Step 2: reject with DataError, leaving the entry
+                        // unmodified. `verify_and_store` already only
+                        // mutates the registry on the success path, so
+                        // there is nothing further to roll back here.
+                        promise.reject_error(cx, Error::Data(None));
+                    },
+                }
+                promise
             },
         }
     }

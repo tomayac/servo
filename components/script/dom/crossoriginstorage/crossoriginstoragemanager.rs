@@ -4,33 +4,23 @@
 
 //! <https://wicg.github.io/cross-origin-storage/#the-crossoriginstoragemanager-interface>
 //!
-//! `requestFileHandle()` currently implements only the read path (`options`
-//! unset, or `options.create` false), and only the hash-shape half of
-//! `validate a COS request` (see `hash::CosHash::validate()`); the
-//! `origins` option checks are not yet implemented, since nothing yet
-//! consumes `origins` on the write path they exist to constrain.
+//! `requestFileHandle()` implements the real registry algorithms (see
+//! `registry.rs`) for the read path. `options.create` still rejects
+//! `NotSupportedError`: even though the registry itself now supports
+//! `complete a create request` and `verify and store`, there is currently
+//! no way to reach them from script, because `FileSystemWritableFileStream`
+//! does not exist yet. See `registry.rs` and
+//! `stream/writablestreamdefaultcontroller.rs`'s
+//! `UnderlyingSinkType::CrossOriginStorageWrite` for exactly how far that
+//! work has gotten and precisely what remains; the short version is that
+//! the write algorithm's chunk-to-bytes conversion is unimplemented, and
+//! `FileSystemWritableFileStream : WritableStream` cannot yet be
+//! constructed at all, because `WritableStream`'s own constructors are not
+//! currently structured to support subclassing the way `Blob`/`File` are.
 //!
-//! Registry lookups go through `stub_registry`, a process-local,
-//! non-persistent, non-spec-conformant stand-in -- see its module doc for
-//! exactly what that does and does not implement. In particular, there is
-//! currently no way for script to populate it (no write path), so every
-//! `requestFileHandle()` call against an unmodified build will reject with
-//! `NotFoundError`, correctly for an empty registry, but not because
-//! availability gating, the Public Hash List, or GREASE'ing are actually
-//! implemented.
-//!
-//! Follow-up work, roughly in dependency order:
-//! 1. `options.create` / the write path: `FileSystemWritableFileStream`,
-//!    which needs a native (Rust-backed) underlying-sink variant in
-//!    `WritableStreamDefaultController` that does not exist yet (today it
-//!    only supports `Js` and `Transfer` sinks). `WritableStream` itself is
-//!    otherwise already implemented in Servo and can be reused directly
-//!    once that gap is closed.
-//! 2. The real COS registry (hash -> entry map, `origins` scoping,
-//!    storing-origins bookkeeping, availability gating, PHL, GREASE'ing)
-//!    per <https://wicg.github.io/cross-origin-storage/#cos-entries>,
-//!    replacing `stub_registry` rather than growing alongside it.
-//! 3. The `origins` option validation in `validate a COS request` step 3.
+//! The `origins` option validation in `validate a COS request` step 3 is
+//! also not yet implemented, since nothing yet consumes `origins` on a
+//! reachable write path.
 
 use std::rc::Rc;
 
@@ -49,7 +39,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::USVString;
 use crate::dom::crossoriginstorage::filesystemfilehandle::FileSystemFileHandle;
 use crate::dom::crossoriginstorage::hash::CosHash;
-use crate::dom::crossoriginstorage::stub_registry;
+use crate::dom::crossoriginstorage::registry::{self, ReadOutcome};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 
@@ -82,12 +72,10 @@ impl CrossOriginStorageManagerMethods<crate::DomTypeHolder> for CrossOriginStora
     ///
     /// See this module's doc comment for what is and is not yet
     /// implemented. Resolves/rejects synchronously rather than via the
-    /// spec's Cross-Origin Storage queue, since `stub_registry` is a
-    /// same-thread in-memory lookup with no actual asynchrony; a real
-    /// registry-backed implementation should revisit this (the spec
-    /// requires registry operations to be enqueued so they execute in
-    /// order without interleaving, which matters once there is a write
-    /// path that could race with reads).
+    /// spec's Cross-Origin Storage queue, since `registry`'s operations
+    /// are same-thread, in-memory, and cannot themselves fail
+    /// asynchronously today; see `registry.rs`'s doc comment for what
+    /// "in-memory" does and does not mean here.
     fn RequestFileHandle(
         &self,
         realm: &mut CurrentRealm,
@@ -111,26 +99,30 @@ impl CrossOriginStorageManagerMethods<crate::DomTypeHolder> for CrossOriginStora
             promise.reject_error(
                 realm,
                 Error::NotSupported(Some(
-                    "Cross-Origin Storage's write path (options.create) is not yet implemented"
+                    "Cross-Origin Storage's write path (options.create) is not yet reachable \
+                     from script; see this module's doc comment"
                         .to_owned(),
                 )),
             );
             return promise;
         }
 
-        // `complete a read request`, against the stub registry rather than
-        // the real one; see this module's doc comment.
-        match stub_registry::get(&cos_hash) {
-            Some(entry) => {
-                // A COS entry has no developer-meaningful name (entries are
-                // identified purely by hash); see filesystemfilehandle.rs's
-                // `new()` doc comment for the placeholder used here.
+        let origin = self.global().origin().immutable().clone();
+        match registry::complete_a_read_request(&cos_hash, &origin) {
+            ReadOutcome::Found(entry) => {
+                // A COS entry has no developer-meaningful name (entries
+                // are identified purely by hash); see
+                // filesystemfilehandle.rs's `new()` doc comment for the
+                // placeholder used here.
                 let name = USVString::from(cos_hash.value.clone());
                 let handle = FileSystemFileHandle::new(realm, &self.global(), name, entry);
                 promise.resolve_native(realm, &handle);
             },
-            None => {
+            ReadOutcome::NotFound => {
                 promise.reject_error(realm, Error::NotFound(None));
+            },
+            ReadOutcome::PendingWrite => {
+                promise.reject_error(realm, Error::NotAllowed(None));
             },
         }
 

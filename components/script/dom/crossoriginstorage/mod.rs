@@ -10,4 +10,4 @@ pub(crate) mod crossoriginstoragemanager;
 pub(crate) mod filesystemfilehandle;
 pub(crate) mod filesystemhandle;
 pub(crate) mod hash;
-pub(crate) mod stub_registry;
+pub(crate) mod registry;

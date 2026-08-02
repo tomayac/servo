@@ -29,7 +29,7 @@ use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::crossoriginstorage::filesystemhandle::FileSystemHandle;
-use crate::dom::crossoriginstorage::stub_registry::StubCosEntryBytes;
+use crate::dom::crossoriginstorage::registry::EntryBytes;
 use crate::dom::file::File;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
@@ -38,11 +38,11 @@ use crate::dom::promise::Promise;
 pub(crate) struct FileSystemFileHandle {
     file_system_handle: FileSystemHandle,
     #[no_trace]
-    entry: StubCosEntryBytes,
+    entry: EntryBytes,
 }
 
 impl FileSystemFileHandle {
-    fn new_inherited(name: USVString, entry: StubCosEntryBytes) -> FileSystemFileHandle {
+    fn new_inherited(name: USVString, entry: EntryBytes) -> FileSystemFileHandle {
         FileSystemFileHandle {
             file_system_handle: FileSystemHandle::new_inherited(FileSystemHandleKind::File, name),
             entry,
@@ -61,7 +61,7 @@ impl FileSystemFileHandle {
         cx: &mut JSContext,
         global: &GlobalScope,
         name: USVString,
-        entry: StubCosEntryBytes,
+        entry: EntryBytes,
     ) -> DomRoot<FileSystemFileHandle> {
         reflect_dom_object_with_cx(
             Box::new(FileSystemFileHandle::new_inherited(name, entry)),
@@ -80,7 +80,7 @@ impl FileSystemFileHandleMethods<crate::DomTypeHolder> for FileSystemFileHandle 
     /// failure modes. Our stub registry is an in-memory `HashMap` lookup
     /// that cannot meaningfully fail, so this resolves synchronously
     /// instead of queuing a task. A real registry-backed implementation
-    /// (see stub_registry.rs's module docs) should revisit this once reads
+    /// (see registry.rs's module docs) should revisit this once reads
     /// can actually fail or block.
     fn GetFile(&self, realm: &mut CurrentRealm) -> Rc<Promise> {
         let promise = Promise::new_in_realm(realm);
