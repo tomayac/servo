@@ -233,6 +233,8 @@ pub(crate) mod console;
 pub(crate) mod cookiestore;
 pub(crate) mod credentialmanagement;
 pub(crate) use self::credentialmanagement::*;
+pub(crate) mod crossoriginstorage;
+pub(crate) use self::crossoriginstorage::*;
 pub(crate) mod css;
 pub(crate) use self::css::*;
 pub(crate) mod customelementregistry;

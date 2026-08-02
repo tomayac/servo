@@ -44,6 +44,7 @@ use crate::dom::bindings::utils::to_frozen_array;
 use crate::dom::bluetooth::Bluetooth;
 use crate::dom::clipboard::Clipboard;
 use crate::dom::credentialmanagement::credentialscontainer::CredentialsContainer;
+use crate::dom::crossoriginstorage::CrossOriginStorageManager;
 use crate::dom::csp::{GlobalCspReporting, Violation};
 #[cfg(feature = "gamepad")]
 use crate::dom::gamepad::Gamepad;
@@ -130,6 +131,7 @@ pub(crate) struct Navigator {
     mediasession: MutNullableDom<MediaSession>,
     clipboard: MutNullableDom<Clipboard>,
     storage: MutNullableDom<StorageManager>,
+    cross_origin_storage: MutNullableDom<CrossOriginStorageManager>,
     #[cfg(feature = "webgpu")]
     gpu: MutNullableDom<GPU>,
     /// <https://www.w3.org/TR/gamepad/#dfn-hasgamepadgesture>
@@ -159,6 +161,7 @@ impl Navigator {
             mediasession: Default::default(),
             clipboard: Default::default(),
             storage: Default::default(),
+            cross_origin_storage: Default::default(),
             #[cfg(feature = "webgpu")]
             gpu: Default::default(),
             #[cfg(feature = "gamepad")]
@@ -519,6 +522,15 @@ impl NavigatorMethods<crate::DomTypeHolder> for Navigator {
     fn Storage(&self, cx: &mut js::context::JSContext) -> DomRoot<StorageManager> {
         self.storage
             .or_init(|| StorageManager::new(cx, &self.global()))
+    }
+
+    /// <https://wicg.github.io/cross-origin-storage/#dom-navigatorcrossoriginstorage-crossoriginstorage>
+    fn CrossOriginStorage(
+        &self,
+        cx: &mut js::context::JSContext,
+    ) -> DomRoot<CrossOriginStorageManager> {
+        self.cross_origin_storage
+            .or_init(|| CrossOriginStorageManager::new(cx, &self.global()))
     }
 
     /// <https://w3c.github.io/beacon/#sec-processing-model>

@@ -160,6 +160,8 @@ pub struct Preferences {
     pub dom_cookiestore_enabled: bool,
     // feature: Credential Management API | #38788 | Web/API/Credential_Management_API
     pub dom_credential_management_enabled: bool,
+    // feature: Cross-Origin Storage | https://wicg.github.io/cross-origin-storage/
+    pub dom_cross_origin_storage_enabled: bool,
     // feature: WebCrypto API | #40687 | Web/API/Web_Crypto_API
     pub dom_crypto_subtle_enabled: bool,
     pub dom_document_dblclick_timeout: i64,
@@ -435,6 +437,7 @@ impl Preferences {
             dom_composition_event_enabled: false,
             dom_cookiestore_enabled: false,
             dom_credential_management_enabled: false,
+            dom_cross_origin_storage_enabled: false,
             dom_crypto_subtle_enabled: true,
             dom_document_dblclick_dist: 1,
             dom_document_dblclick_timeout: 300,
