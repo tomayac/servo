@@ -56,6 +56,14 @@ pub(crate) enum HashValidationError {
 }
 
 impl CosHash {
+    /// A normalized `(algorithm, value)` key suitable for registry lookups:
+    /// per <https://wicg.github.io/cross-origin-storage/#cos-hash-equal>,
+    /// two COS hashes are equal when `algorithm` matches ASCII
+    /// case-insensitively and `value` matches exactly.
+    pub(crate) fn normalized_key(&self) -> (String, String) {
+        (self.algorithm.to_ascii_uppercase(), self.value.clone())
+    }
+
     /// <https://wicg.github.io/cross-origin-storage/#validate-a-cos-request>
     /// steps 1-2 (the hash-shape checks only; the `origins` option checks
     /// in step 3 belong to a future `CrossOriginStorageRequestFileHandleOptions`
