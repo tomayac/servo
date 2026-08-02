@@ -18,7 +18,6 @@
 //! live here.
 //!
 //! Explicitly NOT real:
-//! - No Public Hash List (wildcard entries fail closed).
 //! - No GREASE'ing.
 //! - No `maximum origins list length` or per-origin write quota
 //!   enforcement.
@@ -28,6 +27,16 @@
 //!   threads racing to write the same file (which should not normally
 //!   happen -- there is one resource thread per Servo instance) would not
 //!   be safe, but that is not a realistic configuration here.
+//!
+//! `Wildcard`-scoped (`origins: '*'`) disclosure uses the real Public
+//! Hash List (PHL): `net_traits::public_hash_list::is_hex_digest_on_public_hash_list`,
+//! a bundled, sorted-for-binary-search snapshot of
+//! <https://github.com/tomayac/public-hash-list> (refreshed by
+//! `./mach update-public-hash-list`, also run weekly in CI -- see that
+//! module's doc comment). A hash not on the list still fails closed,
+//! same as before this was wired up; the difference is that a hash *on*
+//! the list is now actually disclosed instead of every wildcard-scoped
+//! entry being unconditionally hidden from non-storing origins.
 //!
 //! `SameSiteOnly` disclosure uses `net_traits::pub_domains::is_same_site`
 //! (Public Suffix List-backed eTLD+1 comparison, the same helper the
@@ -268,7 +277,7 @@ impl CrossOriginStorageStore {
             };
         }
 
-        if !self.apply_availability_gating(entry, origin) {
+        if !self.apply_availability_gating(entry, hash, origin) {
             return CosReadOutcome::NotFound;
         }
 
@@ -374,19 +383,24 @@ impl CrossOriginStorageStore {
     /// <https://wicg.github.io/cross-origin-storage/#apply-availability-gating>
     /// Simplified: GREASE'ing is not implemented; see this module's doc
     /// comment.
-    fn apply_availability_gating(&self, entry: &CosEntry, origin: &ImmutableOrigin) -> bool {
-        determine_cos_disclosure(entry, origin)
+    fn apply_availability_gating(
+        &self,
+        entry: &CosEntry,
+        hash: &CosHash,
+        origin: &ImmutableOrigin,
+    ) -> bool {
+        determine_cos_disclosure(entry, hash, origin)
     }
 }
 
 /// <https://wicg.github.io/cross-origin-storage/#determine-cos-disclosure>
-fn determine_cos_disclosure(entry: &CosEntry, origin: &ImmutableOrigin) -> bool {
+fn determine_cos_disclosure(entry: &CosEntry, hash: &CosHash, origin: &ImmutableOrigin) -> bool {
     if entry.storing_origins.contains(origin) {
         return true;
     }
 
     match &entry.origins {
-        CosOrigins::Wildcard => is_on_public_hash_list(),
+        CosOrigins::Wildcard => is_on_public_hash_list(hash),
         CosOrigins::List(list) => list.contains(origin),
         CosOrigins::SameSiteOnly => entry
             .storing_origins
@@ -395,9 +409,13 @@ fn determine_cos_disclosure(entry: &CosEntry, origin: &ImmutableOrigin) -> bool 
     }
 }
 
-/// Always `false`; see this module's doc comment.
-fn is_on_public_hash_list() -> bool {
-    false
+/// <https://wicg.github.io/cross-origin-storage/#phl>: `net_traits::public_hash_list`'s
+/// bundled snapshot only lists SHA-256 digests (see that module's doc
+/// comment), so a resource hashed with any other algorithm can never be
+/// found on it and always fails closed here.
+fn is_on_public_hash_list(hash: &CosHash) -> bool {
+    hash.algorithm.eq_ignore_ascii_case("SHA-256") &&
+        net_traits::public_hash_list::is_hex_digest_on_public_hash_list(&hash.value)
 }
 
 /// <https://wicg.github.io/cross-origin-storage/#upgrade-resource-visibility>
@@ -599,7 +617,7 @@ mod tests {
     }
 
     #[test]
-    fn wildcard_entry_is_not_readable_by_an_outside_origin_without_a_phl() {
+    fn wildcard_entry_is_not_readable_by_an_outside_origin_when_its_hash_is_not_on_the_phl() {
         let store = store();
         let bytes = b"wildcard-scoped".to_vec();
         let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
@@ -617,12 +635,74 @@ mod tests {
             )
             .unwrap();
 
-        // Fails closed: no PHL is implemented, so a "*"-scoped entry can
-        // never actually be disclosed outside its storing origins today.
+        // Fails closed: this hash (of arbitrary test content) is not on
+        // the bundled Public Hash List snapshot, so a "*"-scoped entry
+        // for it is still not disclosed outside its storing origins.
         assert!(matches!(
             store.complete_a_read_request(&h, &outsider),
             CosReadOutcome::NotFound
         ));
+    }
+
+    /// Inserts a `Written` entry directly into `store`'s registry,
+    /// bypassing `verify_and_store`'s hash-content matching. Needed for
+    /// tests that need a specific, real digest (e.g. one from the bundled
+    /// Public Hash List snapshot) rather than whatever `compute_hex_digest`
+    /// would produce from arbitrary test bytes.
+    fn insert_written_entry_directly(
+        store: &CrossOriginStorageStore,
+        hash: &CosHash,
+        storing_origin: ImmutableOrigin,
+        origins: CosOrigins,
+    ) {
+        let mut data = store.data.write();
+        data.entries.insert(
+            registry_key(hash),
+            CosEntry {
+                bytes: Some(StoredEntryBytes {
+                    bytes: b"whatever".to_vec(),
+                    type_string: "text/plain".to_owned(),
+                }),
+                state: CosEntryState::Written,
+                origins,
+                storing_origins: HashSet::from([storing_origin]),
+                pending_since_unix_secs: 0,
+            },
+        );
+    }
+
+    #[test]
+    fn wildcard_entry_is_readable_by_an_outside_origin_when_its_hash_is_on_the_phl() {
+        let store = store();
+        let writer = origin("https://writer.example");
+        let outsider = origin("https://outsider.example");
+
+        // A real digest from the bundled Public Hash List snapshot --
+        // the same one `net_traits::public_hash_list`'s own tests use;
+        // this may need updating if a future
+        // `./mach update-public-hash-list` refresh ever drops it.
+        let h = hash(
+            "SHA-256",
+            "00003bcf96fc9cb1ac3c88678137b49a3a67a7991aa46f8c944fb8756b51b84e",
+        );
+        insert_written_entry_directly(&store, &h, writer, CosOrigins::Wildcard);
+
+        assert!(matches!(
+            store.complete_a_read_request(&h, &outsider),
+            CosReadOutcome::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn is_on_public_hash_list_rejects_a_non_sha256_algorithm_even_if_the_value_would_match() {
+        // The bundled snapshot is SHA-256 only (see
+        // `net_traits::public_hash_list`'s doc comment), so any other
+        // algorithm always fails closed regardless of `value`.
+        let h = hash(
+            "SHA-1",
+            "00003bcf96fc9cb1ac3c88678137b49a3a67a7991aa46f8c944fb8756b51b84e",
+        );
+        assert!(!is_on_public_hash_list(&h));
     }
 
     #[test]

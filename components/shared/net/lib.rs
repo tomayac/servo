@@ -54,6 +54,7 @@ pub mod image_cache;
 pub mod mime_classifier;
 pub mod policy_container;
 pub mod pub_domains;
+pub mod public_hash_list;
 pub mod quality;
 pub mod request;
 pub(crate) mod resource_fetch_timing;

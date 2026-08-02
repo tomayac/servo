@@ -1,0 +1,69 @@
+name: Update Public Hash List
+
+on:
+  schedule:
+    # Cross-Origin Storage's Public Hash List (PHL) is a rolling-release
+    # allowlist (<https://wicg.github.io/cross-origin-storage/#phl>), so
+    # the bundled snapshot needs to be refreshed periodically, not just
+    # once at introduction. Run weekly, same cadence as the WPT import.
+    - cron: "0 1 * * 0"
+
+  # Allows you to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    # This job is only useful when run on this branch's home fork.
+    if: github.repository == 'tomayac/servo' || github.event_name == 'workflow_dispatch'
+    name: Refresh the bundled Public Hash List snapshot
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+      - name: Setup Python
+        uses: ./.github/actions/setup-python
+      - name: Change Mirror Priorities
+        uses: ./.github/actions/apt-mirrors
+      - name: Bootstrap
+        run: |
+          sudo apt update
+          ./mach bootstrap --yes --skip-lints --skip-nextest
+      - name: Download the latest Public Hash List and regenerate the bundled snapshot
+        run: ./mach update-public-hash-list
+      - name: Check for changes
+        id: diff
+        run: |
+          if git diff --quiet -- components/default-resources/resources/public_hash_list.bin; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Commit changes
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          CURRENT_DATE: ${{ github.run_id }}
+        run: |
+          git config --local user.email "actions@github.com"
+          git config --local user.name "Public Hash List Update Bot"
+          git checkout -b "update_public_hash_list_${CURRENT_DATE}"
+          git add components/default-resources/resources/public_hash_list.bin
+          git commit -m "Refresh the bundled Cross-Origin Storage Public Hash List snapshot"
+      - name: Push changes
+        if: steps.diff.outputs.changed == 'true'
+        uses: ad-m/github-push-action@master
+        with:
+          branch: update_public_hash_list_${{ github.run_id }}
+      - name: Open PR
+        if: steps.diff.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATE_BRANCH: update_public_hash_list_${{ github.run_id }}
+        run: |
+          gh pr create \
+            --title "Refresh the bundled Public Hash List snapshot" \
+            --body "Automated weekly refresh of \`components/default-resources/resources/public_hash_list.bin\` from https://github.com/tomayac/public-hash-list." \
+            --head "$UPDATE_BRANCH"

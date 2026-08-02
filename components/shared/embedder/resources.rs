@@ -140,6 +140,15 @@ pub enum Resource {
     DebuggerJS,
     /// A HTML page to display a pretty printed view of a json document.
     JsonViewerHTML,
+    /// The Cross-Origin Storage Public Hash List (PHL,
+    /// <https://wicg.github.io/cross-origin-storage/#phl>): a k-anonymity
+    /// allowlist of SHA-256 digests unconditionally eligible for
+    /// cross-origin availability disclosure, from
+    /// <https://github.com/tomayac/public-hash-list>. Stored as sorted,
+    /// packed 32-byte digests with no delimiters (see
+    /// `net_traits::public_hash_list`). It can be empty, in which case no
+    /// wildcard-scoped Cross-Origin Storage entry is ever disclosed.
+    PublicHashList,
 }
 
 impl Resource {
@@ -156,6 +165,7 @@ impl Resource {
             Resource::AboutMemoryHTML => "about-memory.html",
             Resource::DebuggerJS => "debugger.js",
             Resource::JsonViewerHTML => "json-viewer.html",
+            Resource::PublicHashList => "public_hash_list.bin",
         }
     }
 }

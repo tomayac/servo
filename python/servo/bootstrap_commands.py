@@ -138,6 +138,51 @@ class MachCommands(CommandBase):
                     print("Warning: the new list contains a case that servo can't handle: %s" % suffix)
                 fo.write(suffix.encode("idna") + b"\n")
 
+    @Command(
+        "update-public-hash-list",
+        description="Download the Cross-Origin Storage Public Hash List and update the copy in servo-default-resources",
+        category="bootstrap",
+    )
+    def update_public_hash_list(self, force: bool = False) -> None:
+        # Third-party, independently maintained snapshot of the WICG
+        # Cross-Origin Storage Public Hash List (PHL); see
+        # <https://wicg.github.io/cross-origin-storage/#phl> and
+        # <https://github.com/tomayac/public-hash-list>.
+        list_url = "https://raw.githubusercontent.com/tomayac/public-hash-list/main/data/public-hash-list.dat"
+        dst_filename = path.join(
+            self.context.topdir,
+            "components",
+            "default-resources",
+            "resources",
+            "public_hash_list.bin",
+        )
+
+        try:
+            content = download_bytes("Public Hash List", list_url)
+        except urllib.error.URLError:
+            print("Unable to download the Public Hash List; are you connected to the internet?")
+            sys.exit(1)
+
+        # Bundled as sorted, packed 32-byte digests (no delimiters, no
+        # comments) rather than the upstream `.dat` file's hex-with-comments
+        # text format, purely to keep the compiled-in resource compact; see
+        # `net_traits::public_hash_list`'s doc comment.
+        digests = set()
+        for line in content.decode("utf8").split("\n"):
+            line = line.strip()
+            if not line or line.startswith("//"):
+                continue
+            if len(line) == 64 and all(c in "0123456789abcdef" for c in line):
+                digests.add(bytes.fromhex(line))
+            else:
+                print("Warning: skipping malformed Public Hash List line: %r" % line[:80])
+
+        with open(dst_filename, "wb") as fo:
+            for digest in sorted(digests):
+                fo.write(digest)
+
+        print(f"Wrote {len(digests)} digests ({len(digests) * 32} bytes) to {dst_filename}")
+
     @Command("clean-nightlies", description="Clean unused nightly builds of Rust and Cargo", category="bootstrap")
     @CommandArgument("--force", "-f", action="store_true", help="Actually remove stuff")
     @CommandArgument("--keep", default="1", help="Keep up to this many most recent nightlies")
