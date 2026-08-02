@@ -8,6 +8,7 @@ pub mod async_runtime;
 pub mod connector;
 pub mod cookie;
 pub mod cookie_storage;
+pub mod cross_origin_storage_thread;
 mod decoder;
 mod devtools;
 pub mod embedder;

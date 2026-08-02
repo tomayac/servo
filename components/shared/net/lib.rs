@@ -38,6 +38,7 @@ use uuid::Uuid;
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct CookieOperationId(pub u64);
 
+use crate::cross_origin_storage_thread::CosThreadMsg;
 use crate::fetch::headers::determine_nosniff;
 use crate::filemanager_thread::FileManagerThreadMsg;
 use crate::http_status::HttpStatus;
@@ -46,6 +47,7 @@ use crate::request::{Request, RequestBuilder};
 use crate::response::{Response, ResponseInit};
 
 pub mod blob_url_store;
+pub mod cross_origin_storage_thread;
 pub mod filemanager_thread;
 pub mod http_status;
 pub mod image_cache;
@@ -781,6 +783,8 @@ pub enum CoreResourceMsg {
     NetworkMediator(IpcSender<CustomResponseMediator>, ImmutableOrigin),
     /// Message forwarded to file manager's handler
     ToFileManager(FileManagerThreadMsg),
+    /// Message forwarded to the Cross-Origin Storage service's handler
+    ToCrossOriginStorage(CosThreadMsg),
     TotalSizeOfInFlightKeepAliveRecords(PipelineId, GenericSender<u64>),
     /// Break the load handler loop, send a reply when done cleaning up local resources
     /// and exit

@@ -63,6 +63,7 @@ use crate::fetch::methods::{
     SharedInflightKeepAliveRecords, WebSocketChannel, fetch,
     transfers_request_body_stream_to_later_manual_redirect,
 };
+use crate::cross_origin_storage_thread::CrossOriginStorageStore;
 use crate::filemanager_thread::FileManager;
 use crate::hsts::{self, HstsList};
 use crate::http_cache::HttpCache;
@@ -153,6 +154,7 @@ pub fn new_core_resource_thread(
                 devtools_sender,
                 time_profiler_chan,
                 embedder_proxy.clone(),
+                config_dir.clone(),
                 ca_certificates.clone(),
                 ignore_certificate_errors,
                 blob_token_communicator,
@@ -646,6 +648,9 @@ impl ResourceChannelManager {
                 }
             },
             CoreResourceMsg::ToFileManager(msg) => self.resource_manager.filemanager.handle(msg),
+            CoreResourceMsg::ToCrossOriginStorage(msg) => {
+                self.resource_manager.cross_origin_storage.handle(msg)
+            },
             CoreResourceMsg::TotalSizeOfInFlightKeepAliveRecords(pipeline_id, sender) => {
                 let total = self
                     .resource_manager
@@ -708,6 +713,7 @@ pub struct CoreResourceManager {
     devtools_sender: Option<Sender<DevtoolsControlMsg>>,
     sw_managers: HashMap<ImmutableOrigin, IpcSender<CustomResponseMediator>>,
     filemanager: FileManager,
+    cross_origin_storage: CrossOriginStorageStore,
     request_interceptor: RequestInterceptor,
     ca_certificates: CACertificates<'static>,
     ignore_certificate_errors: bool,
@@ -721,6 +727,7 @@ impl CoreResourceManager {
         devtools_sender: Option<Sender<DevtoolsControlMsg>>,
         _profiler_chan: ProfilerChan,
         embedder_proxy: GenericEmbedderProxy<NetToEmbedderMsg>,
+        config_dir: Option<PathBuf>,
         ca_certificates: CACertificates<'static>,
         ignore_certificate_errors: bool,
         blob_token_communicator: Arc<Mutex<BlobTokenCommunicator>>,
@@ -729,6 +736,7 @@ impl CoreResourceManager {
             devtools_sender,
             sw_managers: Default::default(),
             filemanager: FileManager::new(embedder_proxy.clone(), blob_token_communicator),
+            cross_origin_storage: CrossOriginStorageStore::new(config_dir),
             request_interceptor: RequestInterceptor::new(embedder_proxy),
             ca_certificates,
             ignore_certificate_errors,
