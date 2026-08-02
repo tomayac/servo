@@ -18,7 +18,6 @@
 //! live here.
 //!
 //! Explicitly NOT real:
-//! - No GREASE'ing.
 //! - No `maximum origins list length` or per-origin write quota
 //!   enforcement.
 //! - Persistence is whole-registry-metadata read-on-startup /
@@ -37,6 +36,13 @@
 //! same as before this was wired up; the difference is that a hash *on*
 //! the list is now actually disclosed instead of every wildcard-scoped
 //! entry being unconditionally hidden from non-storing origins.
+//!
+//! `Wildcard`-scoped entries that pass the PHL check above are also
+//! subject to GREASE'ing: `should_grease` occasionally reports one as
+//! absent anyway, at `GREASE_PROBABILITY`, and only when its stored
+//! bytes are under `GREASE_MAX_SIZE_BYTES` (never for large entries,
+//! where a spurious re-download would be expensive and itself
+//! observable -- see `should_grease`'s doc comment).
 //!
 //! `SameSiteOnly` disclosure uses `net_traits::pub_domains::is_same_site`
 //! (Public Suffix List-backed eTLD+1 comparison, the same helper the
@@ -381,8 +387,6 @@ impl CrossOriginStorageStore {
     }
 
     /// <https://wicg.github.io/cross-origin-storage/#apply-availability-gating>
-    /// Simplified: GREASE'ing is not implemented; see this module's doc
-    /// comment.
     fn apply_availability_gating(
         &self,
         entry: &CosEntry,
@@ -394,13 +398,19 @@ impl CrossOriginStorageStore {
 }
 
 /// <https://wicg.github.io/cross-origin-storage/#determine-cos-disclosure>
+/// GREASE'ing (see `should_grease`) only ever turns a `Wildcard`-scoped
+/// disclosure that would otherwise happen into a lie, never the reverse,
+/// and per the spec's own API Response Reference table only applies to
+/// requesting origins that are not a storing origin -- which is already
+/// guaranteed here, since the early return above already exits before
+/// reaching the `Wildcard` arm for a storing origin's own read.
 fn determine_cos_disclosure(entry: &CosEntry, hash: &CosHash, origin: &ImmutableOrigin) -> bool {
     if entry.storing_origins.contains(origin) {
         return true;
     }
 
     match &entry.origins {
-        CosOrigins::Wildcard => is_on_public_hash_list(hash),
+        CosOrigins::Wildcard => is_on_public_hash_list(hash) && !should_grease(entry),
         CosOrigins::List(list) => list.contains(origin),
         CosOrigins::SameSiteOnly => entry
             .storing_origins
@@ -416,6 +426,41 @@ fn determine_cos_disclosure(entry: &CosEntry, hash: &CosHash, origin: &Immutable
 fn is_on_public_hash_list(hash: &CosHash) -> bool {
     hash.algorithm.eq_ignore_ascii_case("SHA-256") &&
         net_traits::public_hash_list::is_hex_digest_on_public_hash_list(&hash.value)
+}
+
+/// Probability that an eligible `Wildcard`-scoped, otherwise-disclosed
+/// entry is GREASEd (see `should_grease`). Not specified numerically by
+/// the spec ("occasionally"); 1% is this implementation's choice.
+const GREASE_PROBABILITY: f64 = 0.01;
+
+/// Entries at or above this size are never GREASEd, per this module's
+/// doc comment on `should_grease`. 500 KiB is this implementation's
+/// choice for where a spurious re-download stops being "inexpensive";
+/// the spec gives no numeric threshold, only the qualitative constraint.
+const GREASE_MAX_SIZE_BYTES: usize = 500 * 1024;
+
+/// <https://wicg.github.io/cross-origin-storage/#grease>
+/// (GREASE: Generate Random Extensions And Sustain Extensibility.) An
+/// additional privacy mitigation: occasionally lying and reporting a
+/// `Wildcard`-scoped entry as absent even though it is genuinely present
+/// and would otherwise be disclosed, so that a false "not found" can
+/// never be distinguished from a true one -- callers can't treat a
+/// reliable "found" response as proof a resource is actually cached.
+///
+/// Size-gated per the spec's explicit constraint: "User agents must NOT
+/// GREASE responses for files whose size makes a spurious re-download
+/// clearly disproportionate to the privacy benefit" -- a false negative
+/// on a small file just costs an inexpensive re-fetch, but on a large one
+/// (the spec's own example: "gigabyte-scale AI model weights") it would
+/// impose a significant, observable bandwidth/latency cost, which would
+/// itself leak information (a "found-but-GREASEd" response would be
+/// distinguishable from a real miss by its retry latency). Entries with
+/// no stored bytes (should not happen for a `Written` entry, but handled
+/// rather than assumed) are treated as size `0` and are therefore always
+/// eligible -- there is nothing to make an expensive re-download of.
+fn should_grease(entry: &CosEntry) -> bool {
+    let size = entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len());
+    size < GREASE_MAX_SIZE_BYTES && rand::random_bool(GREASE_PROBABILITY)
 }
 
 /// <https://wicg.github.io/cross-origin-storage/#upgrade-resource-visibility>
@@ -654,13 +699,14 @@ mod tests {
         hash: &CosHash,
         storing_origin: ImmutableOrigin,
         origins: CosOrigins,
+        bytes: Vec<u8>,
     ) {
         let mut data = store.data.write();
         data.entries.insert(
             registry_key(hash),
             CosEntry {
                 bytes: Some(StoredEntryBytes {
-                    bytes: b"whatever".to_vec(),
+                    bytes,
                     type_string: "text/plain".to_owned(),
                 }),
                 state: CosEntryState::Written,
@@ -685,7 +731,17 @@ mod tests {
             "SHA-256",
             "00003bcf96fc9cb1ac3c88678137b49a3a67a7991aa46f8c944fb8756b51b84e",
         );
-        insert_written_entry_directly(&store, &h, writer, CosOrigins::Wildcard);
+        // At/above GREASE_MAX_SIZE_BYTES so this test -- which is about
+        // PHL disclosure, not GREASE'ing -- is never flaky from a
+        // GREASE roll; see the dedicated `should_grease`/GREASE'ing
+        // tests below for that.
+        insert_written_entry_directly(
+            &store,
+            &h,
+            writer,
+            CosOrigins::Wildcard,
+            vec![0u8; GREASE_MAX_SIZE_BYTES],
+        );
 
         assert!(matches!(
             store.complete_a_read_request(&h, &outsider),
@@ -703,6 +759,152 @@ mod tests {
             "00003bcf96fc9cb1ac3c88678137b49a3a67a7991aa46f8c944fb8756b51b84e",
         );
         assert!(!is_on_public_hash_list(&h));
+    }
+
+    #[test]
+    fn should_grease_never_greases_entries_at_or_above_the_size_cap() {
+        let entry = CosEntry {
+            bytes: Some(StoredEntryBytes {
+                bytes: vec![0u8; GREASE_MAX_SIZE_BYTES],
+                type_string: "application/octet-stream".to_owned(),
+            }),
+            state: CosEntryState::Written,
+            origins: CosOrigins::Wildcard,
+            storing_origins: HashSet::new(),
+            pending_since_unix_secs: 0,
+        };
+        for _ in 0..500 {
+            assert!(!should_grease(&entry));
+        }
+    }
+
+    #[test]
+    fn should_grease_sometimes_greases_entries_under_the_size_cap() {
+        let entry = CosEntry {
+            bytes: Some(StoredEntryBytes {
+                bytes: vec![0u8; 10],
+                type_string: "text/plain".to_owned(),
+            }),
+            state: CosEntryState::Written,
+            origins: CosOrigins::Wildcard,
+            storing_origins: HashSet::new(),
+            pending_since_unix_secs: 0,
+        };
+        let trials = 3000;
+        let greased_count = (0..trials).filter(|_| should_grease(&entry)).count();
+        // With p=0.1 and 3000 trials, both "always false" and "always
+        // true" are astronomically unlikely (binomial tail probability
+        // effectively zero); a wide pass band avoids ever flaking in
+        // practice while still proving randomness is actually wired up.
+        assert!(
+            greased_count > 0,
+            "expected at least one GREASEd result out of {trials} trials"
+        );
+        assert!(
+            greased_count < trials,
+            "expected at least one non-GREASEd result out of {trials} trials"
+        );
+    }
+
+    #[test]
+    fn wildcard_small_on_phl_entry_is_sometimes_greased_for_an_outside_origin() {
+        let store = store();
+        let writer = origin("https://writer.example");
+        let outsider = origin("https://outsider.example");
+        let h = hash(
+            "SHA-256",
+            "00003bcf96fc9cb1ac3c88678137b49a3a67a7991aa46f8c944fb8756b51b84e",
+        );
+        insert_written_entry_directly(&store, &h, writer, CosOrigins::Wildcard, b"tiny".to_vec());
+
+        let trials = 3000;
+        let mut found = 0;
+        let mut not_found = 0;
+        for _ in 0..trials {
+            match store.complete_a_read_request(&h, &outsider) {
+                CosReadOutcome::Found { .. } => found += 1,
+                CosReadOutcome::NotFound => not_found += 1,
+                CosReadOutcome::PendingWrite => panic!("unexpected PendingWrite"),
+            }
+        }
+        assert!(found > 0, "expected at least one Found (not always GREASEd)");
+        assert!(
+            not_found > 0,
+            "expected at least one NotFound (GREASEd at least once) out of {trials} trials"
+        );
+    }
+
+    #[test]
+    fn wildcard_large_on_phl_entry_is_never_greased_for_an_outside_origin() {
+        let store = store();
+        let writer = origin("https://writer.example");
+        let outsider = origin("https://outsider.example");
+        let h = hash(
+            "SHA-256",
+            "00003bcf96fc9cb1ac3c88678137b49a3a67a7991aa46f8c944fb8756b51b84e",
+        );
+        insert_written_entry_directly(
+            &store,
+            &h,
+            writer,
+            CosOrigins::Wildcard,
+            vec![0u8; GREASE_MAX_SIZE_BYTES],
+        );
+
+        for _ in 0..500 {
+            assert!(matches!(
+                store.complete_a_read_request(&h, &outsider),
+                CosReadOutcome::Found { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn list_scoped_small_entry_is_never_greased_for_a_listed_origin() {
+        // GREASE'ing applies only to Wildcard-scoped entries; List-scoped
+        // ones must never be GREASEd regardless of size.
+        let store = store();
+        let writer = origin("https://writer.example.com");
+        let listed = origin("https://listed.example.com");
+        let h = hash("SHA-256", &"b".repeat(64));
+        insert_written_entry_directly(
+            &store,
+            &h,
+            writer,
+            CosOrigins::List(vec![listed.clone()]),
+            b"tiny".to_vec(),
+        );
+
+        for _ in 0..500 {
+            assert!(matches!(
+                store.complete_a_read_request(&h, &listed),
+                CosReadOutcome::Found { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn same_site_only_small_entry_is_never_greased_for_a_same_site_origin() {
+        // GREASE'ing applies only to Wildcard-scoped entries; SameSiteOnly
+        // ones must never be GREASEd regardless of size.
+        let store = store();
+        let writer = origin("https://writer.example.com");
+        let same_site_reader = origin("https://reader.example.com");
+        let h = hash("SHA-256", &"c".repeat(64));
+        insert_written_entry_directly(
+            &store,
+            &h,
+            writer,
+            CosOrigins::SameSiteOnly,
+            b"tiny".to_vec(),
+        );
+
+        for _ in 0..500 {
+            assert!(matches!(
+                store.complete_a_read_request(&h, &same_site_reader),
+                CosReadOutcome::Found { .. }
+            ));
+        }
     }
 
     #[test]
