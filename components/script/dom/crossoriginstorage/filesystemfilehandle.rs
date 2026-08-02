@@ -26,12 +26,13 @@
 //!   registry read lookup for the same hash if `getFile()` is called on
 //!   this handle.
 //!
-//! `createWritable()` still only works on a `Backing::Create` handle, not
-//! a `Backing::Read` one: the real spec allows `createWritable()` on any
-//! handle whose caller has write rights, not just ones from a
-//! `create: true` request, but supporting that would need a `Backing::Read`
-//! handle to carry write-rights context (`requested_origins`) it does not
-//! currently have, which is a real, if narrower, remaining gap.
+//! `createWritable()` only works on a `Backing::Create` handle, not a
+//! `Backing::Read` one, by design, not as a gap: per the [explainer's
+//! FAQ](https://github.com/WICG/cross-origin-storage/blob/main/README.md#appendixc-frequently-asked-questions-faq)
+//! ("What other API is this API shaped after?"), "if and only if
+//! `options.create` is set to `true`, the user agent will return a handle
+//! that can be written to" -- a handle from a plain (non-`create`)
+//! `requestFileHandle()` call is a read-only handle, full stop.
 
 use std::rc::Rc;
 use std::time::SystemTime;
@@ -210,13 +211,13 @@ impl FileSystemFileHandleMethods<crate::DomTypeHolder> for FileSystemFileHandle 
             requested_origins,
         } = &self.backing
         else {
-            // See this module's doc comment: createWritable() on a
-            // read-mode handle is not yet supported.
+            // See this module's doc comment: a handle not obtained via
+            // options.create is read-only by design, not by omission.
             promise.reject_error(
                 realm,
                 Error::NotSupported(Some(
-                    "createWritable() on a handle not obtained via options.create is not yet \
-                     supported"
+                    "createWritable() only works on a handle obtained via \
+                     requestFileHandle(hash, {create: true})"
                         .to_owned(),
                 )),
             );

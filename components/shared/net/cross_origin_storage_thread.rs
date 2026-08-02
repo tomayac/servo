@@ -115,6 +115,13 @@ pub enum CosThreadMsg {
     Read(CosHash, ImmutableOrigin, GenericCallback<CosReadOutcome>),
     /// `complete a create request` (registry half only).
     Create(CosHash, Option<RequestedOrigins>),
+    /// Sent when a write started via a `create: true` request is
+    /// abandoned (the `FileSystemWritableFileStream`'s `abort()` was
+    /// called) without ever reaching `close()`. Lets the registry remove
+    /// the `Pending` entry immediately rather than leaving it stuck until
+    /// a later request for the same hash notices it is stale; see
+    /// `CrossOriginStorageStore::abandon_pending_write`.
+    AbandonPendingWrite(CosHash),
     /// `verify and store`. The response is `Ok(())` on success, `Err(())`
     /// on hash mismatch (caller should reject with `DataError`). Same
     /// `GenericCallback` reasoning as `Read` above.

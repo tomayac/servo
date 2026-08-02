@@ -259,6 +259,19 @@ pub(crate) fn complete_a_create_request(
     ));
 }
 
+/// Tells the registry a write started via a `create: true` request was
+/// abandoned (`FileSystemWritableFileStream.abort()` was called), so its
+/// `Pending` entry can be removed immediately; see
+/// `net::cross_origin_storage_thread::CrossOriginStorageStore::abandon_pending_write`.
+/// Fire-and-forget, like `complete_a_create_request`: there is nothing
+/// meaningful to do in script if this message does not arrive (the
+/// entry's own staleness timeout is the backstop for that).
+pub(crate) fn abandon_pending_write(global: &GlobalScope, hash: &CosHash) {
+    let _ = global.resource_threads().send(CoreResourceMsg::ToCrossOriginStorage(
+        CosThreadMsg::AbandonPendingWrite(hash.clone()),
+    ));
+}
+
 /// Resolves/rejects a `close()` (write path) promise once the resource
 /// thread responds to `verify_and_store`; see `CosReadResponseHandler`
 /// (same shape, simpler payload).

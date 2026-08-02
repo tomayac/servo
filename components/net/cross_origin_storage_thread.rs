@@ -22,7 +22,6 @@
 //! - No GREASE'ing.
 //! - No `maximum origins list length` or per-origin write quota
 //!   enforcement.
-//! - No eviction of abandoned Pending entries.
 //! - Persistence is whole-registry-metadata read-on-startup /
 //!   write-on-every-mutation JSON (see below for why entry *bytes* are
 //!   not part of that), not incremental or transactional; two resource
@@ -46,10 +45,28 @@
 //! Keeping bytes in their own file makes `persist()`'s cost proportional
 //! to the number of entries, not their total size, and means writing one
 //! entry never implies rewriting any other one.
+//!
+//! A `Pending` entry (created by `complete a create request`, before the
+//! matching `close()`/`verify_and_store` ever runs) can be abandoned:
+//! explicitly, via `FileSystemWritableFileStream.abort()`
+//! (`CosThreadMsg::AbandonPendingWrite`, handled by
+//! `abandon_pending_write` below, removes it immediately), or silently, by
+//! a page navigating away or a stream simply never being closed or
+//! aborted at all (no signal reaches this thread in that case). The
+//! second kind is handled by `PENDING_ENTRY_STALE_AFTER_SECS`: a `Pending`
+//! entry older than that is treated as absent by
+//! `complete_a_read_request` (so a reader is not permanently stuck seeing
+//! `PendingWrite`) and is replaced by a fresh one by
+//! `complete_a_create_request` (so a new write attempt for the same hash
+//! is not permanently blocked either). A `Pending` entry that is still
+//! within the staleness window is left alone by both -- this is also the
+//! ordinary, expected shape of two genuinely concurrent writes for the
+//! same hash racing each other, not just the abandoned case.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::digest;
 use log::warn;
@@ -63,6 +80,18 @@ use servo_url::ImmutableOrigin;
 const PERSISTED_FILENAME: &str = "cross_origin_storage_registry.json";
 const ENTRY_BYTES_DIR: &str = "cos_entries";
 
+/// How long a `Pending` entry is left alone before `complete_a_read_request`
+/// and `complete_a_create_request` treat it as abandoned; see this
+/// module's doc comment.
+const PENDING_ENTRY_STALE_AFTER_SECS: u64 = 5 * 60;
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
 /// Path of the on-disk file holding one entry's raw bytes. `key` is
 /// `registry_key()`'s `"ALGORITHM:hex_value"` form; `:` is replaced since
 /// it is not a safe filename character on every platform this needs to
@@ -73,7 +102,7 @@ fn entry_bytes_path(config_dir: &Path, key: &str) -> PathBuf {
         .join(format!("{}.bin", key.replace(':', "_")))
 }
 
-#[derive(Clone, Copy, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 enum CosEntryState {
     Pending,
     Written,
@@ -103,6 +132,17 @@ struct CosEntry {
     state: CosEntryState,
     origins: CosOrigins,
     storing_origins: HashSet<ImmutableOrigin>,
+    /// Seconds since the Unix epoch when this entry was created (i.e. when
+    /// it became `Pending`). Only consulted while `state` is still
+    /// `Pending`; see `is_stale_pending` and this module's doc comment.
+    pending_since_unix_secs: u64,
+}
+
+/// Whether `entry` is a `Pending` entry old enough to be treated as
+/// abandoned; see this module's doc comment.
+fn is_stale_pending(entry: &CosEntry) -> bool {
+    entry.state == CosEntryState::Pending &&
+        unix_now_secs().saturating_sub(entry.pending_since_unix_secs) > PENDING_ENTRY_STALE_AFTER_SECS
 }
 
 /// The persisted (and in-memory) registry contents. `HashMap` keys here
@@ -199,6 +239,9 @@ impl CrossOriginStorageStore {
             CosThreadMsg::Create(hash, requested_origins) => {
                 self.complete_a_create_request(&hash, requested_origins);
             },
+            CosThreadMsg::AbandonPendingWrite(hash) => {
+                self.abandon_pending_write(&hash);
+            },
             CosThreadMsg::VerifyAndStore(hash, bytes, type_string, origin, requested_origins, response_sender) => {
                 let result =
                     self.verify_and_store(&hash, bytes, type_string, origin, requested_origins);
@@ -215,7 +258,14 @@ impl CrossOriginStorageStore {
         };
 
         if entry.state == CosEntryState::Pending {
-            return CosReadOutcome::PendingWrite;
+            // A stale Pending entry is treated as if it were never
+            // created, per this module's doc comment: an abandoned write
+            // must not permanently block readers behind PendingWrite.
+            return if is_stale_pending(entry) {
+                CosReadOutcome::NotFound
+            } else {
+                CosReadOutcome::PendingWrite
+            };
         }
 
         if !self.apply_availability_gating(entry, origin) {
@@ -240,13 +290,41 @@ impl CrossOriginStorageStore {
         };
 
         let mut data = self.data.write();
-        data.entries.entry(registry_key(hash)).or_insert_with(|| CosEntry {
-            bytes: None,
-            state: CosEntryState::Pending,
-            origins: normalized,
-            storing_origins: HashSet::new(),
-        });
+        let key = registry_key(hash);
+        // A stale Pending entry from an abandoned write is replaced with
+        // a fresh one, same as if the hash had never been requested
+        // before; see this module's doc comment. A Written entry, or a
+        // Pending one still within the staleness window (an ordinary
+        // in-flight write, possibly a genuinely concurrent one from
+        // another origin), is left untouched.
+        let needs_fresh_entry = match data.entries.get(&key) {
+            None => true,
+            Some(existing) => is_stale_pending(existing),
+        };
+        if needs_fresh_entry {
+            data.entries.insert(key, CosEntry {
+                bytes: None,
+                state: CosEntryState::Pending,
+                origins: normalized,
+                storing_origins: HashSet::new(),
+                pending_since_unix_secs: unix_now_secs(),
+            });
+        }
         self.persist(&data);
+    }
+
+    /// See `CosThreadMsg::AbandonPendingWrite`.
+    fn abandon_pending_write(&self, hash: &CosHash) {
+        let mut data = self.data.write();
+        let key = registry_key(hash);
+        // Only remove it while still Pending: if another origin's write
+        // for the same hash already completed (a genuinely concurrent
+        // write racing this now-aborted one), that Written entry must
+        // survive this abort.
+        if matches!(data.entries.get(&key), Some(entry) if entry.state == CosEntryState::Pending) {
+            data.entries.remove(&key);
+            self.persist(&data);
+        }
     }
 
     /// <https://wicg.github.io/cross-origin-storage/#verify-and-store>
@@ -281,6 +359,7 @@ impl CrossOriginStorageStore {
                 state: CosEntryState::Pending,
                 origins: CosOrigins::SameSiteOnly,
                 storing_origins: HashSet::new(),
+                pending_since_unix_secs: unix_now_secs(),
             });
 
         entry.bytes = Some(StoredEntryBytes { bytes, type_string });
@@ -578,6 +657,116 @@ mod tests {
         let data = store.data.read();
         let entry = data.entries.get(&registry_key(&h)).unwrap();
         assert!(matches!(entry.origins, CosOrigins::Wildcard));
+    }
+
+    #[test]
+    fn fresh_pending_entry_blocks_readers_with_pending_write() {
+        let store = store();
+        let h = hash("SHA-256", &"1".repeat(64));
+        let reader = origin("https://reader.example");
+
+        store.complete_a_create_request(&h, None);
+
+        assert!(matches!(
+            store.complete_a_read_request(&h, &reader),
+            CosReadOutcome::PendingWrite
+        ));
+    }
+
+    #[test]
+    fn stale_pending_entry_reads_as_not_found_instead_of_pending_write() {
+        let store = store();
+        let h = hash("SHA-256", &"2".repeat(64));
+        let reader = origin("https://reader.example");
+
+        store.complete_a_create_request(&h, None);
+        backdate_pending_entry(&store, &h);
+
+        assert!(matches!(
+            store.complete_a_read_request(&h, &reader),
+            CosReadOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn stale_pending_entry_is_replaced_by_a_fresh_create_request_and_becomes_writable() {
+        let store = store();
+        let h = hash("SHA-256", &"3".repeat(64));
+        let writer = origin("https://writer.example");
+
+        // First attempt: created, then abandoned (backdated to simulate
+        // a page that navigated away without ever closing or aborting).
+        store.complete_a_create_request(&h, None);
+        backdate_pending_entry(&store, &h);
+
+        // A second create request for the same hash must not stay stuck
+        // behind the stale entry -- it gets a fresh one, and a real write
+        // against it succeeds normally.
+        store.complete_a_create_request(&h, None);
+        let bytes = b"retried after abandonment".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        store.complete_a_create_request(&h, None);
+        store
+            .verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None)
+            .unwrap();
+
+        match store.complete_a_read_request(&h, &writer) {
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
+            other => panic!("expected the retried write to succeed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn abandon_pending_write_removes_a_still_pending_entry_immediately() {
+        let store = store();
+        let h = hash("SHA-256", &"4".repeat(64));
+        let reader = origin("https://reader.example");
+
+        store.complete_a_create_request(&h, None);
+        store.abandon_pending_write(&h);
+
+        // Gone entirely, not just stale -- a fresh create request should
+        // insert a brand new entry rather than finding anything to leave
+        // alone or replace.
+        assert!(matches!(
+            store.complete_a_read_request(&h, &reader),
+            CosReadOutcome::NotFound
+        ));
+        assert!(!store.data.read().entries.contains_key(&registry_key(&h)));
+    }
+
+    #[test]
+    fn abandon_pending_write_does_not_remove_an_already_written_entry() {
+        // A benign race: origin A's write is aborted after origin B's
+        // write for the same hash already completed. The completed entry
+        // must survive A's (now-late) abandonment signal.
+        let store = store();
+        let bytes = b"already-written-by-someone-else".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        let writer = origin("https://writer.example");
+
+        store
+            .verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None)
+            .unwrap();
+        store.abandon_pending_write(&h);
+
+        match store.complete_a_read_request(&h, &writer) {
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
+            other => panic!("expected the written entry to survive, got {other:?}"),
+        }
+    }
+
+    /// Rewrites `hash`'s entry (which must already exist and be Pending)
+    /// to look like it was created long enough ago to count as
+    /// abandoned, without waiting `PENDING_ENTRY_STALE_AFTER_SECS` for
+    /// real.
+    fn backdate_pending_entry(store: &CrossOriginStorageStore, hash: &CosHash) {
+        let mut data = store.data.write();
+        let entry = data.entries.get_mut(&registry_key(hash)).unwrap();
+        assert_eq!(entry.state, CosEntryState::Pending);
+        entry.pending_since_unix_secs = 0;
     }
 
     #[test]

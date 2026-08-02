@@ -23,23 +23,27 @@
 //! which `write()` is implemented in terms of (acquire a writer, write,
 //! release the lock -- see `Write()` below).
 //!
-//! `write()` accepts `BufferSource` or `Blob` chunks (see the
-//! `CrossOriginStorageWrite` write algorithm in
-//! `stream/writablestreamdefaultcontroller.rs` for exactly what that
-//! covers); `USVString` and `WriteParams` (positioned writes) chunks are
-//! not converted -- `data` is forwarded to the writer verbatim, so passing
-//! either would reach the sink unconverted and be rejected as an
-//! unsupported chunk type.
+//! `write()` accepts the full real chunk union -- `ArrayBuffer`,
+//! `ArrayBufferView`, `Blob`, `USVString`, or a `WriteParams` dictionary
+//! (`{type: "write"|"seek"|"truncate", position, size, data}`, letting a
+//! single `write()` call also seek or truncate) -- via manual conversion
+//! in the `CrossOriginStorageWrite` write algorithm in
+//! `stream/writablestreamdefaultcontroller.rs`; `data` is forwarded to
+//! the writer verbatim (`write(any data)`), so that algorithm is where
+//! the actual chunk-type dispatch happens, not here.
 //!
-//! `seek()`'s omission of any real effect is a known, real gap (not just
-//! missing sugar): it is accepted and resolves, for API completeness, but
-//! does not affect where a later `write()` call lands, since the sink is
-//! append-only (COS's model is "write the complete file contents", so
-//! random-access rewriting was considered out of scope when the sink was
-//! built). `truncate()` is real: it resizes the accumulated write buffer
-//! directly (see `WritableStreamDefaultController::cross_origin_storage_truncate`).
+//! `seek()` and `truncate()` are both real: per
+//! <https://fs.spec.whatwg.org/#filesystemwritablefilestream> the sink
+//! tracks a `[[position]]` slot into the accumulated write buffer.
+//! `write()` writes at the current position and advances it;
+//! `seek()` sets the position directly (a later `write()` past the
+//! current end of the buffer zero-pads the gap, matching the spec's
+//! "write command" algorithm); `truncate()` resizes the buffer and
+//! clamps the position down if it now exceeds the new size. See
+//! `WritableStreamDefaultController::cross_origin_storage_seek` and
+//! `cross_origin_storage_truncate`.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
@@ -98,6 +102,7 @@ impl FileSystemWritableFileStream {
         let underlying_sink_type = UnderlyingSinkType::CrossOriginStorageWrite {
             hash,
             bytes: RefCell::new(Vec::new()),
+            position: Cell::new(0),
             type_string: String::new(),
             origin,
             requested_origins: RefCell::new(requested_origins),
@@ -129,8 +134,9 @@ impl FileSystemWritableFileStreamMethods<crate::DomTypeHolder> for FileSystemWri
     /// "Let writer be the result of getting a writer for this. Let result
     /// be the result of writing a chunk to writer given data. Release
     /// writer's lock. Return result." -- `data` is forwarded to the
-    /// writer verbatim (no `WriteParams` unwrapping); see this module's
-    /// doc comment for which chunk types the sink accepts.
+    /// writer verbatim; the sink's write algorithm (not this method) is
+    /// what recognizes and unwraps a `WriteParams` chunk. See this
+    /// module's doc comment for which chunk types the sink accepts.
     fn Write(&self, realm: &mut CurrentRealm, data: SafeHandleValue) -> Rc<Promise> {
         let global = GlobalScope::from_current_realm(realm);
         let writer = match self.writable_stream.aquire_default_writer(realm, &global) {
@@ -147,16 +153,20 @@ impl FileSystemWritableFileStreamMethods<crate::DomTypeHolder> for FileSystemWri
     }
 
     /// <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-seek>
-    /// See this module's doc comment: accepted for API completeness, but
-    /// does not reposition later writes.
-    fn Seek(&self, realm: &mut CurrentRealm, _position: u64) -> Rc<Promise> {
+    fn Seek(&self, realm: &mut CurrentRealm, position: u64) -> Rc<Promise> {
         let global = GlobalScope::from_current_realm(realm);
+        let promise = Promise::new(realm, &global);
         if !self.writable_stream.is_writable() {
-            let promise = Promise::new(realm, &global);
             promise.reject_error(realm, Error::Type(c"Stream is not writable".to_owned()));
             return promise;
         }
-        Promise::new_resolved(realm, &global, ())
+        let Some(controller) = self.writable_stream.get_controller() else {
+            promise.reject_error(realm, Error::Type(c"Stream has no controller".to_owned()));
+            return promise;
+        };
+        controller.cross_origin_storage_seek(position as usize);
+        promise.resolve_native(realm, &());
+        promise
     }
 
     /// <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-truncate>

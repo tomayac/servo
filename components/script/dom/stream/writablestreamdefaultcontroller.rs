@@ -22,12 +22,16 @@ use crate::dom::bindings::codegen::Bindings::UnderlyingSinkBinding::{
     UnderlyingSinkAbortCallback, UnderlyingSinkCloseCallback, UnderlyingSinkStartCallback,
     UnderlyingSinkWriteCallback,
 };
+use crate::dom::bindings::codegen::Bindings::FileSystemWritableFileStreamBinding::{
+    WriteCommandType, WriteParams,
+};
 use crate::dom::bindings::codegen::Bindings::WritableStreamDefaultControllerBinding::WritableStreamDefaultControllerMethods;
 use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer;
 use crate::dom::bindings::conversions::root_from_handlevalue;
 use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
+use crate::dom::bindings::str::USVString;
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::messageport::MessagePort;
 use crate::dom::promise::Promise;
@@ -310,6 +314,14 @@ pub enum UnderlyingSinkType {
         hash: crate::dom::crossoriginstorage::hash::CosHash,
         #[no_trace = "Vec<u8> and RefCell hold no JS-managed data"]
         bytes: RefCell<Vec<u8>>,
+        /// The stream's `[[position]]` slot
+        /// (<https://fs.spec.whatwg.org/#filesystemwritablefilestream>):
+        /// where the next `write()` lands in `bytes`, advanced by each
+        /// write's length and settable directly by `seek()`. Writing past
+        /// the current end of `bytes` zero-pads the gap, matching a real
+        /// file's semantics.
+        #[no_trace = "Cell<usize> holds no JS-managed data"]
+        position: Cell<usize>,
         #[no_trace = "String holds no JS-managed data"]
         type_string: String,
         #[no_trace]
@@ -367,6 +379,147 @@ pub struct WritableStreamDefaultController {
 
     /// <https://streams.spec.whatwg.org/#writablestreamdefaultcontroller-abortcontroller>
     abort_controller: Dom<AbortController>,
+}
+
+/// Writes `chunk_bytes` into `bytes` at `position`'s current value,
+/// zero-padding first if that lands past the current end (matching a real
+/// file's semantics), then advances `position` by `chunk_bytes.len()`.
+/// Shared by every chunk type (`ArrayBuffer`/`ArrayBufferView`, `Blob`,
+/// `USVString`) `CrossOriginStorageWrite`'s write algorithm accepts.
+fn write_chunk_at_position(bytes: &RefCell<Vec<u8>>, position: &Cell<usize>, chunk_bytes: &[u8]) {
+    let mut buf = bytes.borrow_mut();
+    let start = position.get();
+    let end = start + chunk_bytes.len();
+    if end > buf.len() {
+        buf.resize(end, 0);
+    }
+    buf[start..end].copy_from_slice(chunk_bytes);
+    drop(buf);
+    position.set(end);
+}
+
+/// Parses `value` as `ArrayBuffer`/`ArrayBufferView`, `Blob`, or
+/// `USVString` -- the three "plain data" chunk types -- and writes its
+/// bytes at `position` in `bytes`, settling `promise` accordingly. Shared
+/// by a bare `write()` chunk and by a `WriteParams` dictionary's
+/// `"write"` command's `data` member, which both accept exactly these
+/// three types (see
+/// <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-write>).
+fn write_plain_data_chunk(
+    cx: &mut JSContext,
+    promise: &Rc<Promise>,
+    value: SafeHandleValue,
+    bytes: &RefCell<Vec<u8>>,
+    position: &Cell<usize>,
+) {
+    match ArrayBufferViewOrArrayBuffer::safe_from_jsval(cx, value, ()) {
+        Ok(ConversionResult::Success(buffer_source)) => {
+            let chunk_bytes =
+                get_buffer_source_copy(ArrayBufferViewOrArrayBufferRef::from(&buffer_source));
+            write_chunk_at_position(bytes, position, &chunk_bytes);
+            promise.resolve_native(cx, &());
+        },
+        Ok(ConversionResult::Failure(_)) => match root_from_handlevalue::<Blob>(cx, value) {
+            Ok(blob) => match blob.get_bytes() {
+                Ok(blob_bytes) => {
+                    write_chunk_at_position(bytes, position, &blob_bytes);
+                    promise.resolve_native(cx, &());
+                },
+                Err(()) => {
+                    promise.reject_error(
+                        cx,
+                        Error::Type(c"Failed to read Blob contents".to_owned()),
+                    );
+                },
+            },
+            Err(()) => match USVString::safe_from_jsval(cx, value, ()) {
+                Ok(ConversionResult::Success(USVString(text))) => {
+                    write_chunk_at_position(bytes, position, text.as_bytes());
+                    promise.resolve_native(cx, &());
+                },
+                Ok(ConversionResult::Failure(_)) => {
+                    promise.reject_error(
+                        cx,
+                        Error::Type(
+                            c"Cross-Origin Storage writable streams only accept \
+                              ArrayBuffer, ArrayBufferView, Blob, or USVString data"
+                                .to_owned(),
+                        ),
+                    );
+                },
+                Err(()) => {
+                    promise.reject_error(cx, Error::JSFailed);
+                },
+            },
+        },
+        Err(()) => {
+            promise.reject_error(cx, Error::JSFailed);
+        },
+    }
+}
+
+/// Applies a `WriteParams` chunk's `type` command to `bytes`/`position`,
+/// per <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-write>:
+/// - `"seek"`: `position` is required; sets `[[position]]` directly (same
+///   effect as `FileSystemWritableFileStream.seek()`).
+/// - `"truncate"`: `size` is required; resizes `bytes`, clamping
+///   `[[position]]` down if it now exceeds the new size (same effect as
+///   `FileSystemWritableFileStream.truncate()`).
+/// - `"write"`: `data` is required (`ArrayBuffer`/`ArrayBufferView`/
+///   `Blob`/`USVString`); if `position` is also given, seeks there first
+///   (a one-shot positioned write), then writes `data` at `[[position]]`
+///   and advances it, same as a bare chunk would.
+fn apply_write_params(
+    cx: &mut JSContext,
+    promise: &Rc<Promise>,
+    bytes: &RefCell<Vec<u8>>,
+    position: &Cell<usize>,
+    params: &WriteParams,
+) {
+    match params.type_ {
+        WriteCommandType::Seek => match params.position {
+            Some(Some(target)) => {
+                position.set(target as usize);
+                promise.resolve_native(cx, &());
+            },
+            _ => {
+                promise.reject_error(
+                    cx,
+                    Error::Type(c"WriteParams with type \"seek\" requires a position".to_owned()),
+                );
+            },
+        },
+        WriteCommandType::Truncate => match params.size {
+            Some(Some(size)) => {
+                let size = size as usize;
+                bytes.borrow_mut().resize(size, 0);
+                if position.get() > size {
+                    position.set(size);
+                }
+                promise.resolve_native(cx, &());
+            },
+            _ => {
+                promise.reject_error(
+                    cx,
+                    Error::Type(c"WriteParams with type \"truncate\" requires a size".to_owned()),
+                );
+            },
+        },
+        WriteCommandType::Write => {
+            rooted!(&in(cx) let data = params.data.get());
+            if data.is_undefined() {
+                promise.reject_error(
+                    cx,
+                    Error::Type(c"WriteParams with type \"write\" requires data".to_owned()),
+                );
+                return;
+            }
+            if let Some(Some(target)) = params.position {
+                position.set(target as usize);
+            }
+            write_plain_data_chunk(cx, promise, data.handle(), bytes, position);
+        },
+    }
 }
 
 impl WritableStreamDefaultController {
@@ -667,18 +820,16 @@ impl WritableStreamDefaultController {
                     .transform_stream_default_sink_abort_algorithm(cx, global, reason)
                     .expect("Transform stream default sink abort algorithm should not fail.")
             },
-            UnderlyingSinkType::CrossOriginStorageWrite { bytes, .. } => {
+            UnderlyingSinkType::CrossOriginStorageWrite { hash, bytes, .. } => {
                 // Discard accumulated bytes; verify_and_store is
                 // deliberately not called on abort, so no entry is
-                // written. Note: if `complete a create request` already
-                // created a Pending registry entry for this hash (see
-                // crossoriginstoragemanager.rs), that entry is left
-                // dangling in the Pending state -- this registry has no
-                // eviction/cleanup for abandoned pending entries. A real
-                // implementation should address this, e.g. by removing a
-                // still-Pending entry with no other in-flight writer on
-                // abort.
+                // written. `complete a create request` (see
+                // crossoriginstoragemanager.rs) already created a Pending
+                // registry entry for this hash, though, so tell the
+                // registry to remove it now rather than leaving it
+                // dangling until its staleness timeout elapses.
                 bytes.borrow_mut().clear();
+                crate::dom::crossoriginstorage::registry::abandon_pending_write(global, hash);
                 Promise::new_resolved(cx, global, ())
             },
         };
@@ -765,47 +916,44 @@ impl WritableStreamDefaultController {
                     .transform_stream_default_sink_write_algorithm(cx, global, chunk)
                     .expect("Transform stream default sink write algorithm should not fail.")
             },
-            UnderlyingSinkType::CrossOriginStorageWrite { bytes, .. } => {
+            UnderlyingSinkType::CrossOriginStorageWrite { bytes, position, .. } => {
                 // <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-write>
-                // (the ArrayBuffer/ArrayBufferView and Blob cases of
-                // FileSystemWriteChunkType; USVString and WriteParams
-                // chunks are still not supported.)
+                // covers the full real union type (ArrayBuffer,
+                // ArrayBufferView, Blob, USVString, WriteParams).
                 //
                 // `chunk` is an arbitrary, already-dequeued internal
                 // value here, not a WebIDL method argument, so there is
-                // no automatic conversion. `ArrayBufferViewOrArrayBuffer`
-                // is a codegen'd union type, and -- like every codegen'd
-                // union type -- implements `FromJSValConvertible`
-                // (js::conversions), which is a plain trait method
-                // callable manually, not only from generated
+                // no automatic conversion -- every branch below converts
+                // manually. `ArrayBufferViewOrArrayBuffer` and
+                // `WriteParams` are codegen'd union/dictionary types, and
+                // -- like every codegen'd type -- implement
+                // `FromJSValConvertible` (js::conversions), a plain trait
+                // method callable manually, not only from generated
                 // argument-binding code. Pattern for the three-way
                 // Result<ConversionResult<T>, ()> match confirmed against
                 // dom/bindings/conversions.rs's own use of the same API.
                 //
-                // A chunk that isn't a BufferSource is tried as a `Blob`
-                // next, via `root_from_handlevalue`, the same manual
-                // DOM-object-from-`HandleValue` downcast `indexeddb.rs`
-                // already uses for exactly this "arbitrary internal value,
-                // might be a Blob" situation. `Blob::get_bytes()` is
-                // synchronous because in-memory `Blob`s (as constructed by
-                // `new Blob([...])`, which is what every real caller of
-                // this write path uses) already have their bytes resident;
-                // it is not a general "read arbitrary Blob contents"
-                // primitive.
+                // `WriteParams` is only tried once `ArrayBuffer`/
+                // `ArrayBufferView`/`Blob` are ruled out: a `Blob` has its
+                // own `type` property (its MIME type), which would
+                // otherwise be misread as `WriteParams`'s required `type`
+                // member and rejected as an invalid `WriteCommandType`.
+                // A chunk that is none of those four is tried as
+                // `USVString` last, via `write_plain_data_chunk`.
                 let promise = Promise::new(cx, global);
                 match ArrayBufferViewOrArrayBuffer::safe_from_jsval(cx, chunk, ()) {
                     Ok(ConversionResult::Success(buffer_source)) => {
                         let chunk_bytes = get_buffer_source_copy(
                             ArrayBufferViewOrArrayBufferRef::from(&buffer_source),
                         );
-                        bytes.borrow_mut().extend_from_slice(&chunk_bytes);
+                        write_chunk_at_position(bytes, position, &chunk_bytes);
                         promise.resolve_native(cx, &());
                     },
                     Ok(ConversionResult::Failure(_)) => match root_from_handlevalue::<Blob>(cx, chunk)
                     {
                         Ok(blob) => match blob.get_bytes() {
                             Ok(blob_bytes) => {
-                                bytes.borrow_mut().extend_from_slice(&blob_bytes);
+                                write_chunk_at_position(bytes, position, &blob_bytes);
                                 promise.resolve_native(cx, &());
                             },
                             Err(()) => {
@@ -815,15 +963,16 @@ impl WritableStreamDefaultController {
                                 );
                             },
                         },
-                        Err(()) => {
-                            promise.reject_error(
-                                cx,
-                                Error::Type(
-                                    c"Cross-Origin Storage writable streams currently only \
-                                      accept ArrayBuffer, ArrayBufferView, or Blob chunks"
-                                        .to_owned(),
-                                ),
-                            );
+                        Err(()) => match WriteParams::new(cx, chunk) {
+                            Ok(ConversionResult::Success(params)) => {
+                                apply_write_params(cx, &promise, bytes, position, &params);
+                            },
+                            Ok(ConversionResult::Failure(_)) => {
+                                write_plain_data_chunk(cx, &promise, chunk, bytes, position);
+                            },
+                            Err(()) => {
+                                promise.reject_error(cx, Error::JSFailed);
+                            },
                         },
                     },
                     Err(()) => {
@@ -885,6 +1034,7 @@ impl WritableStreamDefaultController {
                 type_string,
                 origin,
                 requested_origins,
+                ..
             } => {
                 // <https://wicg.github.io/cross-origin-storage/#verify-and-store>
                 // Resolves/rejects `promise` asynchronously once the
@@ -1062,11 +1212,36 @@ impl WritableStreamDefaultController {
     /// `FileSystemWritableFileStream`.
     pub(crate) fn cross_origin_storage_truncate(&self, size: usize) {
         match &self.underlying_sink_type {
-            UnderlyingSinkType::CrossOriginStorageWrite { bytes, .. } => {
+            UnderlyingSinkType::CrossOriginStorageWrite { bytes, position, .. } => {
                 bytes.borrow_mut().resize(size, 0);
+                // <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-truncate>
+                // "If writable's [[position]] is greater than size, set
+                // writable's [[position]] to size."
+                if position.get() > size {
+                    position.set(size);
+                }
             },
             _ => unreachable!(
                 "cross_origin_storage_truncate called on a non-CrossOriginStorageWrite sink"
+            ),
+        }
+    }
+
+    /// Sets the `[[position]]` slot directly, for
+    /// `FileSystemWritableFileStream::Seek()`. See the `position` field's
+    /// doc comment on `UnderlyingSinkType::CrossOriginStorageWrite`.
+    ///
+    /// # Panics
+    /// If `self`'s underlying sink is not `CrossOriginStorageWrite`. Only
+    /// call this on a controller known to back a
+    /// `FileSystemWritableFileStream`.
+    pub(crate) fn cross_origin_storage_seek(&self, new_position: usize) {
+        match &self.underlying_sink_type {
+            UnderlyingSinkType::CrossOriginStorageWrite { position, .. } => {
+                position.set(new_position);
+            },
+            _ => unreachable!(
+                "cross_origin_storage_seek called on a non-CrossOriginStorageWrite sink"
             ),
         }
     }
