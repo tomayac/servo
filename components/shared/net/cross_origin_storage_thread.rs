@@ -12,8 +12,8 @@
 //! crate for the same reason: both `script` and `net` need these types,
 //! and `net` cannot depend on `script`.
 
-use ipc_channel::ipc::IpcSender;
 use serde::{Deserialize, Serialize};
+use servo_base::generic_channel::GenericSender;
 use servo_url::ImmutableOrigin;
 
 /// A COS hash, per
@@ -109,7 +109,7 @@ pub enum CosReadOutcome {
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CosThreadMsg {
     /// `complete a read request`.
-    Read(CosHash, ImmutableOrigin, IpcSender<CosReadOutcome>),
+    Read(CosHash, ImmutableOrigin, GenericSender<CosReadOutcome>),
     /// `complete a create request` (registry half only).
     Create(CosHash, Option<RequestedOrigins>),
     /// `verify and store`. The response is `Ok(())` on success, `Err(())`
@@ -120,7 +120,7 @@ pub enum CosThreadMsg {
         String,
         ImmutableOrigin,
         Option<RequestedOrigins>,
-        IpcSender<Result<(), ()>>,
+        GenericSender<Result<(), ()>>,
     ),
 }
 

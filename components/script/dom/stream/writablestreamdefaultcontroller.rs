@@ -864,6 +864,7 @@ impl WritableStreamDefaultController {
                 let written_bytes = bytes.borrow_mut().split_off(0);
                 let requested = requested_origins.borrow_mut().take();
                 match crate::dom::crossoriginstorage::registry::verify_and_store(
+                    global,
                     hash,
                     written_bytes,
                     type_string.clone(),

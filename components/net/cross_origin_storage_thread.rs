@@ -288,3 +288,216 @@ fn compute_hex_digest(algorithm: &str, bytes: &[u8]) -> Option<String> {
             .collect(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hash(algorithm: &str, value: &str) -> CosHash {
+        CosHash {
+            algorithm: algorithm.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    fn origin(url: &str) -> ImmutableOrigin {
+        ImmutableOrigin::new(&url::Url::parse(url).unwrap())
+    }
+
+    /// `config_dir: None` throughout: these tests exercise the in-memory
+    /// algorithms only, not the persistence path.
+    fn store() -> CrossOriginStorageStore {
+        CrossOriginStorageStore::new(None)
+    }
+
+    #[test]
+    fn unknown_hash_reads_as_not_found() {
+        let store = store();
+        let h = hash("SHA-256", &"a".repeat(64));
+        let o = origin("https://example.com");
+        assert!(matches!(
+            store.complete_a_read_request(&h, &o),
+            CosReadOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn write_then_read_by_storing_origin_succeeds() {
+        let store = store();
+        let bytes = b"hello cos".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        let writer = origin("https://writer.example");
+
+        assert!(
+            store
+                .verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None)
+                .is_ok()
+        );
+
+        match store.complete_a_read_request(&h, &writer) {
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
+            _ => panic!("expected the storing origin to read its own write back"),
+        }
+    }
+
+    #[test]
+    fn write_rejected_on_hash_mismatch() {
+        let store = store();
+        let h = hash("SHA-256", &"0".repeat(64));
+        let writer = origin("https://writer.example");
+        assert!(
+            store
+                .verify_and_store(&h, b"wrong bytes".to_vec(), "text/plain".to_owned(), writer, None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn same_site_only_entry_is_not_readable_by_a_different_origin() {
+        let store = store();
+        let bytes = b"same-site-scoped".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        let writer = origin("https://writer.example");
+        let other = origin("https://other.example");
+
+        store
+            .verify_and_store(&h, bytes, "text/plain".to_owned(), writer, None)
+            .unwrap();
+
+        assert!(matches!(
+            store.complete_a_read_request(&h, &other),
+            CosReadOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn list_scoped_entry_is_readable_by_a_listed_origin() {
+        let store = store();
+        let bytes = b"list-scoped".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        let writer = origin("https://writer.example");
+        let listed = origin("https://listed.example");
+
+        store
+            .verify_and_store(
+                &h,
+                bytes,
+                "text/plain".to_owned(),
+                writer,
+                Some(RequestedOrigins::List(vec![listed.clone()])),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.complete_a_read_request(&h, &listed),
+            CosReadOutcome::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn wildcard_entry_is_not_readable_by_an_outside_origin_without_a_phl() {
+        let store = store();
+        let bytes = b"wildcard-scoped".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        let writer = origin("https://writer.example");
+        let outsider = origin("https://outsider.example");
+
+        store
+            .verify_and_store(
+                &h,
+                bytes,
+                "text/plain".to_owned(),
+                writer,
+                Some(RequestedOrigins::Wildcard),
+            )
+            .unwrap();
+
+        // Fails closed: no PHL is implemented, so a "*"-scoped entry can
+        // never actually be disclosed outside its storing origins today.
+        assert!(matches!(
+            store.complete_a_read_request(&h, &outsider),
+            CosReadOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn visibility_upgrade_never_downgrades_from_wildcard() {
+        let store = store();
+        let bytes = b"upgrade-test".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        let writer = origin("https://writer.example");
+
+        store
+            .verify_and_store(
+                &h,
+                bytes.clone(),
+                "text/plain".to_owned(),
+                writer.clone(),
+                Some(RequestedOrigins::Wildcard),
+            )
+            .unwrap();
+
+        let second_writer = origin("https://second-writer.example");
+        store
+            .verify_and_store(
+                &h,
+                bytes,
+                "text/plain".to_owned(),
+                second_writer,
+                Some(RequestedOrigins::List(vec![origin("https://narrow.example")])),
+            )
+            .unwrap();
+
+        let data = store.data.read();
+        let entry = data.entries.get(&registry_key(&h)).unwrap();
+        assert!(matches!(entry.origins, CosOrigins::Wildcard));
+    }
+
+    #[test]
+    fn persists_across_store_instances_with_the_same_config_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "servo-cos-registry-test-{}",
+            uuid_like_suffix()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bytes = b"persisted".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        let writer = origin("https://writer.example");
+
+        {
+            let store = CrossOriginStorageStore::new(Some(dir.clone()));
+            store
+                .verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None)
+                .unwrap();
+        }
+
+        // A fresh store pointed at the same config_dir should load what
+        // the previous instance persisted, without any write happening in
+        // between -- this is the "survives a restart" property.
+        let reloaded = CrossOriginStorageStore::new(Some(dir.clone()));
+        match reloaded.complete_a_read_request(&h, &writer) {
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
+            _ => panic!("expected the reloaded store to have the persisted entry"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cheap, dependency-free unique-ish suffix for a temp test directory
+    /// name; not a real UUID, just needs to not collide across parallel
+    /// test runs.
+    fn uuid_like_suffix() -> u128 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    }
+}
