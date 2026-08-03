@@ -676,6 +676,14 @@ impl CrossOriginStorageStore {
                     needed,
                 );
                 if origin_storage_usage(&data, &origin) + new_bytes_len > share {
+                    // Persisted even on rejection: eviction above already
+                    // removed entries and deleted their on-disk byte
+                    // files, so the registry metadata must be saved to
+                    // match -- otherwise a restart before any later
+                    // successful mutation would leave stale entries in
+                    // the persisted JSON pointing at byte files that no
+                    // longer exist.
+                    self.persist(&data);
                     return VerifyAndStoreOutcome::QuotaExceeded {
                         quota_bytes: share,
                         requested_bytes: new_bytes_len,
@@ -689,6 +697,8 @@ impl CrossOriginStorageStore {
             let needed = used_after_self_eviction + new_bytes_len - budget;
             evict_globally_lru(&mut data, self.config_dir.as_deref(), needed);
             if total_bytes_used(&data) + new_bytes_len > budget {
+                // Same reasoning as the per-origin-share rejection above.
+                self.persist(&data);
                 return VerifyAndStoreOutcome::QuotaExceeded {
                     quota_bytes: budget,
                     requested_bytes: new_bytes_len,
@@ -2165,6 +2175,57 @@ mod tests {
             VerifyAndStoreOutcome::QuotaExceeded { .. } => {},
             other => panic!("expected QuotaExceeded, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn eviction_during_a_rejected_write_is_still_persisted_to_disk() {
+        let dir = std::env::temp_dir().join(format!("servo-cos-registry-test-{}", uuid_like_suffix()));
+        let a = origin("https://a.example.com");
+        let small_bytes = b"small".to_vec();
+        let small_hex = compute_hex_digest("SHA-256", &small_bytes).unwrap();
+        let small_hash = hash("SHA-256", &small_hex);
+
+        {
+            let mut store = CrossOriginStorageStore::new(Some(dir.clone()));
+            store.set_fake_free_disk_space(100);
+
+            // First write: small, fits comfortably within a's share.
+            assert!(matches!(
+                store.verify_and_store(&small_hash, small_bytes.clone(), "text/plain".to_owned(), a.clone(), None),
+                VerifyAndStoreOutcome::Success
+            ));
+
+            // Second write: alone bigger than a's entire share, even
+            // after evicting everything a owns -- forces eviction of
+            // the first entry (to try to make room) but is still
+            // rejected, since the new entry alone doesn't fit either.
+            let huge_bytes = vec![0u8; 1000];
+            let huge_hex = compute_hex_digest("SHA-256", &huge_bytes).unwrap();
+            let huge_hash = hash("SHA-256", &huge_hex);
+            match store.verify_and_store(&huge_hash, huge_bytes, "text/plain".to_owned(), a.clone(), None) {
+                VerifyAndStoreOutcome::QuotaExceeded { .. } => {},
+                other => panic!("expected QuotaExceeded, got {other:?}"),
+            }
+
+            // In-memory, the small entry is already gone (evicted while
+            // trying to make room, even though it wasn't enough).
+            assert!(matches!(
+                store.complete_a_read_request(&small_hash, &a),
+                CosReadOutcome::NotFound
+            ));
+        }
+
+        // A *fresh* store loaded from the same config_dir: if the
+        // eviction above hadn't been persisted, this would still find
+        // the small entry (its metadata still in the registry JSON,
+        // even though its bytes file was already deleted).
+        let reloaded = CrossOriginStorageStore::new(Some(dir.clone()));
+        assert!(matches!(
+            reloaded.complete_a_read_request(&small_hash, &a),
+            CosReadOutcome::NotFound
+        ));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Cheap, dependency-free unique-ish suffix for a temp test directory
