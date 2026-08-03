@@ -30,10 +30,10 @@
 //! a bundled, sorted-for-binary-search snapshot of
 //! <https://github.com/tomayac/public-hash-list> (refreshed by
 //! `./mach update-public-hash-list`, also run weekly in CI -- see that
-//! module's doc comment). A hash not on the list still fails closed,
-//! same as before this was wired up; the difference is that a hash *on*
-//! the list is now actually disclosed instead of every wildcard-scoped
-//! entry being unconditionally hidden from non-storing origins.
+//! module's doc comment). A hash not on the list fails closed: only a
+//! `Wildcard`-scoped entry whose hash is confirmed present on the PHL is
+//! disclosed to non-storing origins; every other `Wildcard`-scoped entry
+//! stays hidden from them.
 //!
 //! `Wildcard`-scoped entries that pass the PHL check above are also
 //! subject to GREASE'ing: `should_grease` occasionally reports one as
@@ -104,14 +104,12 @@
 //! `persist_entry_bytes()`, only for a `Written` entry). Keeping bytes out
 //! of the metadata file means a mutation that only touches metadata (e.g.
 //! a fresh `Pending` entry from `complete_a_create_request`) never has to
-//! rewrite any entry's bytes, and vice versa. Splitting metadata itself
-//! into one file per entry (rather than one JSON blob for the whole
-//! registry) means `persist_entry()`'s cost is proportional to the size
-//! of the one entry that actually changed, not the number of entries in
-//! the registry -- writing or reading back one entry never implies
-//! touching any other one. `CrossOriginStorageStore::new()` loads the
-//! registry back by scanning this directory for `.json` files rather than
-//! reading one combined file.
+//! rewrite any entry's bytes, and vice versa. Metadata is itself split
+//! one file per entry, so `persist_entry()`'s cost is proportional to the
+//! size of the one entry that actually changed, not the number of
+//! entries in the registry -- writing or reading back one entry never
+//! implies touching any other one. `CrossOriginStorageStore::new()`
+//! loads the registry by scanning this directory for `.json` files.
 //!
 //! A `Pending` entry (created by `complete a create request`, before the
 //! matching `close()`/`verify_and_store` ever runs) can be abandoned:
@@ -232,8 +230,8 @@ enum CosOrigins {
 
 #[derive(Clone, Deserialize, Serialize)]
 struct StoredEntryBytes {
-    /// Not part of the registry JSON; see this module's doc comment.
-    /// Populated from its own per-entry file, either right after a
+    /// Not part of the entry's metadata JSON; see this module's doc
+    /// comment. Populated from its own per-entry file, either right after a
     /// successful `verify_and_store` (in memory only, no re-read needed)
     /// or by `CrossOriginStorageStore::new()` on startup.
     #[serde(skip)]
@@ -257,9 +255,9 @@ struct CosEntry {
     /// doc comment on storage budgeting. `#[serde(default)]` so a
     /// registry persisted before this field existed still deserializes,
     /// with old entries defaulting to the oldest possible value (`0`) --
-    /// making them the first ones evicted under the new scheme, which is
-    /// a reasonable default for entries this implementation has no real
-    /// recency information about yet.
+    /// making them the first ones evicted, a reasonable default for
+    /// entries this implementation has no real recency information about
+    /// yet.
     #[serde(default)]
     last_read_unix_secs: u64,
 }
@@ -272,12 +270,11 @@ fn is_stale_pending(entry: &CosEntry) -> bool {
 }
 
 /// The in-memory registry contents. `HashMap` keys here are plain
-/// `String`s (the hash's normalized `"ALGORITHM:value"` form), not the
-/// `(String, String)` tuple used internally elsewhere in this codebase's
-/// COS work: `serde_json` cannot serialize a tuple as a JSON object key,
-/// only a plain string. Never serialized as a whole; see this module's
-/// doc comment on per-entry persistence -- `PersistedEntry` is the unit
-/// that actually round-trips through JSON.
+/// `String`s (`registry_key()`'s normalized `"ALGORITHM:value"` form):
+/// `serde_json` cannot serialize a tuple as a JSON object key, only a
+/// plain string. Never serialized as a whole; see this module's doc
+/// comment on per-entry persistence -- `PersistedEntry` is the unit that
+/// actually round-trips through JSON.
 #[derive(Default)]
 struct CosRegistryData {
     entries: HashMap<String, CosEntry>,
@@ -285,12 +282,11 @@ struct CosRegistryData {
 
 /// On-disk shape of one entry's metadata file (`entry_metadata_path()`),
 /// for reading it back. Bundles the registry key alongside the entry
-/// itself since a standalone per-entry file has nowhere else to record
-/// which hash it belongs to (unlike a whole-registry file, where the key
-/// would be the surrounding JSON object's field name) --
-/// `CrossOriginStorageStore::new()` needs it back to reconstruct the
-/// in-memory `HashMap`'s key when scanning `cos_entries/` on startup. See
-/// `PersistedEntryRef` for the write side.
+/// itself, since a standalone file has no field name of its own to double
+/// as a key the way a JSON object's entries do -- `CrossOriginStorageStore::new()`
+/// needs the key back explicitly to reconstruct the in-memory `HashMap`
+/// when scanning `cos_entries/` on startup. See `PersistedEntryRef` for
+/// the write side.
 #[derive(Deserialize)]
 struct PersistedEntry {
     key: String,
@@ -1192,13 +1188,11 @@ fn delete_entry_bytes_file(config_dir: Option<&Path>, key: &str) {
 }
 
 /// Deletes an evicted (or abandoned) entry's per-entry metadata file, if
-/// `config_dir` is set; the sibling of `delete_entry_bytes_file`. Called
-/// immediately as part of eviction/abandonment itself (rather than
-/// deferred to some later whole-registry persist) now that each entry's
-/// metadata is its own file; see this module's doc comment on per-entry
-/// persistence. A missing file is not a warning-worthy problem; any other
-/// error is, since it means an entry that should be gone is still
-/// discoverable on the next `CrossOriginStorageStore::new()`.
+/// `config_dir` is set; the sibling of `delete_entry_bytes_file`, called
+/// immediately as part of eviction/abandonment itself so an entry that
+/// should be gone doesn't remain discoverable on the next
+/// `CrossOriginStorageStore::new()`. A missing file is not a
+/// warning-worthy problem; any other error is.
 fn delete_entry_metadata_file(config_dir: Option<&Path>, key: &str) {
     let Some(dir) = config_dir else {
         return;
@@ -2654,10 +2648,9 @@ mod tests {
             ));
         }
 
-        // A *fresh* store loaded from the same config_dir: if the
-        // eviction above hadn't been persisted, this would still find
-        // the small entry (its metadata still in the registry JSON,
-        // even though its bytes file was already deleted).
+        // A *fresh* store loaded from the same config_dir: if eviction
+        // hadn't deleted the small entry's metadata file, this would
+        // still find it, even though its bytes file was already deleted.
         let reloaded = CrossOriginStorageStore::new(Some(dir.clone()));
         assert!(matches!(
             reloaded.complete_a_read_request(&small_hash, &a),

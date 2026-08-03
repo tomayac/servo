@@ -14,19 +14,14 @@
 //! module and `stream/writablestreamdefaultcontroller.rs`'s
 //! `UnderlyingSinkType::CrossOriginStorageWrite` for how that is wired.
 //!
-//! Known simplifications, beyond what `registry.rs` and
-//! `filesystemfilehandle.rs` already document:
-//! - A malformed candidate in `options.origins` rejects the whole request
-//!   with a `TypeError`, per spec step 3; this part is implemented for
-//!   real, not simplified.
-//! - `options.origins`'s own `maximum origins list length` is enforced
-//!   here (see `RequestFileHandle`'s length check right after calling
-//!   `validate_and_normalize_requested_origins`) with a `TypeError`
-//!   before any write is attempted, per
-//!   <https://wicg.github.io/cross-origin-storage/#normalize-requested-origins>.
-//!   See `net_traits::cross_origin_storage_thread::MAX_ORIGINS_LIST_LENGTH`'s
-//!   doc comment for the shared constant and the *merge*-time counterpart
-//!   of this same limit in `net::cross_origin_storage_thread::upgrade_resource_visibility`.
+//! `options.origins`'s `maximum origins list length` is enforced here
+//! (see `RequestFileHandle`'s length check right after calling
+//! `validate_and_normalize_requested_origins`) with a `TypeError` before
+//! any write is attempted, per
+//! <https://wicg.github.io/cross-origin-storage/#normalize-requested-origins>.
+//! See `net_traits::cross_origin_storage_thread::MAX_ORIGINS_LIST_LENGTH`'s
+//! doc comment for the shared constant and the *merge*-time counterpart of
+//! this same limit in `net::cross_origin_storage_thread::upgrade_resource_visibility`.
 
 use std::ffi::CString;
 use std::rc::Rc;

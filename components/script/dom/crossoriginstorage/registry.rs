@@ -10,8 +10,8 @@
 //! `RequestedOrigins`, `CosReadOutcome` (the wire form) and the actual
 //! spec algorithms live in `net_traits::cross_origin_storage_thread` /
 //! `net::cross_origin_storage_thread`; see those modules' doc comments
-//! for what is and is not spec-conformant. Nothing about that changed in
-//! this file -- only how the response gets back to script.
+//! for what is and is not spec-conformant. This file is only responsible
+//! for getting the response back to script.
 //!
 //! Non-blocking: each function here sends a message carrying a
 //! `GenericCallback` and returns immediately; the resource thread's
@@ -244,8 +244,7 @@ pub(crate) fn complete_a_read_request_for_file(
 
 /// <https://wicg.github.io/cross-origin-storage/#complete-a-create-request>
 /// (registry half only; handle construction is the caller's job). No
-/// response is expected (and was none before this file's functions
-/// became non-blocking either): the resource thread never replies to
+/// response is expected: the resource thread never replies to
 /// `CosThreadMsg::Create` at all.
 pub(crate) fn complete_a_create_request(
     global: &GlobalScope,

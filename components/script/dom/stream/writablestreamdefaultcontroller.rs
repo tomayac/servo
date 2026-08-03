@@ -302,13 +302,11 @@ pub enum UnderlyingSinkType {
     Transform(Dom<TransformStream>, Rc<Promise>),
     /// Algorithms supporting Cross-Origin Storage's write path
     /// (<https://wicg.github.io/cross-origin-storage/#creating-and-writing-files>)
-    /// are implemented in Rust. This is the first genuinely native
-    /// (non-`Js`, non-`Transfer`) sink variant added since `Transform`;
-    /// see `crossoriginstorage::filesystemwritablefilestream` for the
-    /// caller, which composes a `WritableStream` in and reflects itself
-    /// (the same pattern `File`/`Blob` use), via
-    /// `writablestream::setup_writable_stream_default_controller_for`
-    /// (added alongside this variant specifically to support that).
+    /// are implemented in Rust. See
+    /// `crossoriginstorage::filesystemwritablefilestream` for the caller,
+    /// which composes a `WritableStream` in and reflects itself (the same
+    /// pattern `File`/`Blob` use), via
+    /// `writablestream::setup_writable_stream_default_controller_for`.
     CrossOriginStorageWrite {
         #[no_trace]
         hash: crate::dom::crossoriginstorage::hash::CosHash,
