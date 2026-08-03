@@ -183,7 +183,7 @@ impl CrossOriginStorageManagerMethods<crate::DomTypeHolder> for CrossOriginStora
 
         if options.create {
             // `complete a create request`.
-            registry::complete_a_create_request(&self.global(), &cos_hash, requested_origins.clone());
+            registry::complete_a_create_request(&self.global(), &cos_hash, &origin, requested_origins.clone());
             let handle = FileSystemFileHandle::new_for_create(
                 realm,
                 &self.global(),

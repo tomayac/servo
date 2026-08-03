@@ -167,8 +167,11 @@ pub enum CosThreadMsg {
     /// `script::dom::crossoriginstorage::registry`'s doc comment for why
     /// that matters.
     Read(CosHash, ImmutableOrigin, GenericCallback<CosReadOutcome>),
-    /// `complete a create request` (registry half only).
-    Create(CosHash, Option<RequestedOrigins>),
+    /// `complete a create request` (registry half only). Carries the
+    /// requesting origin so the resource thread can rate-limit it (see
+    /// `net::cross_origin_storage_thread`'s doc comment on
+    /// `consume_write_token`); no response is expected either way.
+    Create(CosHash, ImmutableOrigin, Option<RequestedOrigins>),
     /// Sent when a write started via a `create: true` request is
     /// abandoned (the `FileSystemWritableFileStream`'s `abort()` was
     /// called) without ever reaching `close()`. Lets the registry remove

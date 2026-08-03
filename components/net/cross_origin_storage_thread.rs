@@ -52,13 +52,15 @@
 //! capacity/refill numbers and reasoning); over budget, the call is
 //! answered with `NotFound` the same way GREASE'ing lies, so hitting the
 //! limit is not itself an observable signal. `complete_a_create_request`
-//! is deliberately NOT budgeted the same way: it has no return value at
-//! all (see its own doc comment), so it carries no directly observable
-//! signal for an origin to probe with today. `verify_and_store` (the
-//! actual disk-writing step, unlike `complete_a_create_request`) has its
-//! own separate `consume_write_token` rate limit instead -- see
+//! has no return value at all (see its own doc comment), so it is not a
+//! *fingerprinting* oracle the way reads are -- but it still shares
+//! `verify_and_store`'s `consume_write_token` write-probe budget (see
 //! `WRITE_BUDGET_CAPACITY`'s doc comment for why writes get a smaller,
-//! slower budget than reads.
+//! slower budget than reads), since a `create()` is the first step of a
+//! write attempt and unbounded `create()` calls are still real registry
+//! churn and disk I/O (each one that needs a fresh entry persists the
+//! whole registry file) worth bounding, independent of whether they are
+//! ever observable to the calling script.
 //!
 //! `verify_and_store` also enforces a storage budget, not spec-mandated
 //! (the explainer only mentions LRU-based eviction under storage
@@ -285,13 +287,17 @@ const PROBE_BUDGET_REFILL_PER_SECOND: f64 = 20.0;
 
 /// Burst capacity and steady-state refill rate for this implementation's
 /// per-origin *write*-probe rate limit (`consume_write_token`), the
-/// same mechanism as the read-probe budget above but applied to
-/// `verify_and_store` instead: an origin flooding `create()`/`close()`
-/// calls churns the registry and disk I/O regardless of whether writes
-/// are ever actually observable the way reads are (see this module's
-/// doc comment). Smaller and slower than the read budget, since a write
-/// is inherently more expensive for a caller to mount than a read (it
-/// has to actually transmit and hash real bytes), and a legitimate cold
+/// same mechanism as the read-probe budget above but shared by both
+/// `complete_a_create_request` and `verify_and_store`: an origin
+/// flooding `create()`/`close()` calls churns the registry and disk I/O
+/// regardless of whether writes are ever actually observable the way
+/// reads are (see this module's doc comment). One shared budget rather
+/// than two separate ones, since `create()` is just the first step of a
+/// write attempt -- spending it on `create()` calls correspondingly
+/// reduces what is left for the `verify_and_store` that would normally
+/// follow. Smaller and slower than the read budget, since a write is
+/// inherently more expensive for a caller to mount than a read (it has
+/// to actually transmit and hash real bytes), and a legitimate cold
 /// cache load still means writing each missing shard only *once*, not
 /// repeatedly.
 const WRITE_BUDGET_CAPACITY: f64 = 200.0;
@@ -424,14 +430,19 @@ impl CrossOriginStorageStore {
         )
     }
 
-    /// The write counterpart of `consume_probe_token`; see
+    /// The write counterpart of `consume_probe_token`, shared by
+    /// `complete_a_create_request` and `verify_and_store`; see
     /// `WRITE_BUDGET_CAPACITY`'s doc comment for why it has different
-    /// numbers. Returns whether a token was available (the write may
-    /// proceed) or the origin is over budget (`verify_and_store` should
-    /// reject with a real, distinguishable error -- unlike a read, a
-    /// write has no honest way to "lie" about having happened: silently
-    /// pretending success without actually storing the caller's data
-    /// would be a correctness problem, not just a privacy one).
+    /// numbers and why one budget covers both callers. Returns whether a
+    /// token was available (the caller may proceed) or the origin is
+    /// over budget. The two callers respond differently when out of
+    /// budget: `verify_and_store` rejects with a real, distinguishable
+    /// error (unlike a read, a write has no honest way to "lie" about
+    /// having happened -- silently pretending success without actually
+    /// storing the caller's data would be a correctness problem, not
+    /// just a privacy one), while `complete_a_create_request` -- which
+    /// has no return value to reject with in the first place -- simply
+    /// no-ops.
     fn consume_write_token(&self, origin: &ImmutableOrigin) -> bool {
         consume_token(
             &self.write_budgets,
@@ -500,8 +511,8 @@ impl CrossOriginStorageStore {
                 let outcome = self.complete_a_read_request(&hash, &origin);
                 let _ = response_sender.send(outcome);
             },
-            CosThreadMsg::Create(hash, requested_origins) => {
-                self.complete_a_create_request(&hash, requested_origins);
+            CosThreadMsg::Create(hash, origin, requested_origins) => {
+                self.complete_a_create_request(&hash, &origin, requested_origins);
             },
             CosThreadMsg::AbandonPendingWrite(hash) => {
                 self.abandon_pending_write(&hash);
@@ -573,7 +584,29 @@ impl CrossOriginStorageStore {
     }
 
     /// <https://wicg.github.io/cross-origin-storage/#complete-a-create-request>
-    fn complete_a_create_request(&self, hash: &CosHash, requested_origins: Option<RequestedOrigins>) {
+    /// Shares `verify_and_store`'s write-probe budget
+    /// (`consume_write_token`): a `create()` call is the first step of a
+    /// write attempt, and gating it separately would just add a second
+    /// budget to reason about for no real benefit -- an origin that
+    /// spends its budget on `create()` calls has correspondingly less
+    /// left for the `verify_and_store` that would normally follow, so
+    /// the abuse is still bounded either way. Rate-limited here means a
+    /// silent no-op, matching this function's existing "no response
+    /// expected" shape (see its caller's doc comment): script still gets
+    /// a handle back regardless (`crossoriginstoragemanager.rs` never
+    /// awaited this call anyway), and if the abuse continues into an
+    /// actual `close()`, that surfaces the real, visible
+    /// `NotAllowedError` via `verify_and_store`'s own `RateLimited`.
+    fn complete_a_create_request(
+        &self,
+        hash: &CosHash,
+        origin: &ImmutableOrigin,
+        requested_origins: Option<RequestedOrigins>,
+    ) {
+        if !self.consume_write_token(origin) {
+            return;
+        }
+
         let normalized = match requested_origins {
             None => CosOrigins::SameSiteOnly,
             Some(RequestedOrigins::Wildcard) => CosOrigins::Wildcard,
@@ -601,8 +634,16 @@ impl CrossOriginStorageStore {
                 pending_since_unix_secs: unix_now_secs(),
                 last_read_unix_secs: unix_now_secs(),
             });
+            // Only persisted when something actually changed: unlike
+            // `verify_and_store`, a repeated `create()` call for a hash
+            // that already has a fresh entry is a legitimate, common,
+            // idempotent no-op (the same handle-obtaining call a page
+            // might make many times for the same hash), and rewriting
+            // the whole registry file for it every time would be a real,
+            // needless disk-I/O cost with no corresponding state change
+            // to justify it.
+            self.persist(&data);
         }
-        self.persist(&data);
     }
 
     /// See `CosThreadMsg::AbandonPendingWrite`.
@@ -1823,9 +1864,10 @@ mod tests {
     fn fresh_pending_entry_blocks_readers_with_pending_write() {
         let store = store();
         let h = hash("SHA-256", &"1".repeat(64));
+        let creator = origin("https://creator.example");
         let reader = origin("https://reader.example");
 
-        store.complete_a_create_request(&h, None);
+        store.complete_a_create_request(&h, &creator, None);
 
         assert!(matches!(
             store.complete_a_read_request(&h, &reader),
@@ -1837,9 +1879,10 @@ mod tests {
     fn stale_pending_entry_reads_as_not_found_instead_of_pending_write() {
         let store = store();
         let h = hash("SHA-256", &"2".repeat(64));
+        let creator = origin("https://creator.example");
         let reader = origin("https://reader.example");
 
-        store.complete_a_create_request(&h, None);
+        store.complete_a_create_request(&h, &creator, None);
         backdate_pending_entry(&store, &h);
 
         assert!(matches!(
@@ -1856,17 +1899,17 @@ mod tests {
 
         // First attempt: created, then abandoned (backdated to simulate
         // a page that navigated away without ever closing or aborting).
-        store.complete_a_create_request(&h, None);
+        store.complete_a_create_request(&h, &writer, None);
         backdate_pending_entry(&store, &h);
 
         // A second create request for the same hash must not stay stuck
         // behind the stale entry -- it gets a fresh one, and a real write
         // against it succeeds normally.
-        store.complete_a_create_request(&h, None);
+        store.complete_a_create_request(&h, &writer, None);
         let bytes = b"retried after abandonment".to_vec();
         let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
         let h = hash("SHA-256", &computed);
-        store.complete_a_create_request(&h, None);
+        store.complete_a_create_request(&h, &writer, None);
         assert!(matches!(
             store.verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None),
             VerifyAndStoreOutcome::Success
@@ -1882,9 +1925,10 @@ mod tests {
     fn abandon_pending_write_removes_a_still_pending_entry_immediately() {
         let store = store();
         let h = hash("SHA-256", &"4".repeat(64));
+        let creator = origin("https://creator.example");
         let reader = origin("https://reader.example");
 
-        store.complete_a_create_request(&h, None);
+        store.complete_a_create_request(&h, &creator, None);
         store.abandon_pending_write(&h);
 
         // Gone entirely, not just stale -- a fresh create request should
@@ -2140,6 +2184,78 @@ mod tests {
         }
         assert_eq!(allowed, WRITE_BUDGET_CAPACITY as usize);
         assert!(!store.consume_write_token(&o));
+    }
+
+    #[test]
+    fn complete_a_create_request_shares_the_write_budget_with_verify_and_store() {
+        let store = store();
+        let o = origin("https://origin.example.com");
+
+        // Exhaust the entire write budget via create() calls alone --
+        // each a distinct hash, so every one is a genuine,
+        // budget-consuming call, not a no-op the fresh-entry check would
+        // skip regardless.
+        for i in 0..(WRITE_BUDGET_CAPACITY as usize) {
+            let h = hash("SHA-256", &format!("{i:064x}"));
+            store.complete_a_create_request(&h, &o, None);
+        }
+
+        // A real write attempt from the same origin must now be
+        // rate-limited too: create() and verify_and_store() share one
+        // budget, not two separate ones.
+        let bytes = b"over-shared-write-budget".to_vec();
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+        assert!(matches!(
+            store.verify_and_store(&h, bytes, "text/plain".to_owned(), o, None),
+            VerifyAndStoreOutcome::RateLimited
+        ));
+    }
+
+    #[test]
+    fn complete_a_create_request_is_a_no_op_when_write_budget_exhausted() {
+        let store = store();
+        let o = origin("https://origin.example.com");
+        for _ in 0..(WRITE_BUDGET_CAPACITY as usize) {
+            store.consume_write_token(&o);
+        }
+
+        let h = hash("SHA-256", &"6".repeat(64));
+        store.complete_a_create_request(&h, &o, None);
+
+        // No entry should have been created at all: the call was
+        // silently dropped for being over budget, before ever touching
+        // the registry.
+        let data = store.data.read();
+        assert!(!data.entries.contains_key(&registry_key(&h)));
+    }
+
+    #[test]
+    fn complete_a_create_request_does_not_rewrite_the_registry_file_for_a_no_op_repeat() {
+        let dir = std::env::temp_dir().join(format!("servo-cos-registry-test-{}", uuid_like_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = CrossOriginStorageStore::new(Some(dir.clone()));
+        let creator = origin("https://creator.example.com");
+        let h = hash("SHA-256", &"7".repeat(64));
+
+        store.complete_a_create_request(&h, &creator, None);
+        let registry_path = dir.join(PERSISTED_FILENAME);
+        let mtime_after_first_create = std::fs::metadata(&registry_path).unwrap().modified().unwrap();
+
+        // Some filesystems only have 1-second mtime resolution; wait
+        // long enough that a real rewrite would produce an observably
+        // different mtime.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // A second create() for the same hash, which already has a
+        // fresh Pending entry, is a genuine no-op -- the registry file
+        // must not be rewritten for it.
+        store.complete_a_create_request(&h, &creator, None);
+        let mtime_after_second_create = std::fs::metadata(&registry_path).unwrap().modified().unwrap();
+
+        assert_eq!(mtime_after_first_create, mtime_after_second_create);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

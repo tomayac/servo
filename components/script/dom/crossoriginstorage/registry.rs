@@ -250,11 +250,13 @@ pub(crate) fn complete_a_read_request_for_file(
 pub(crate) fn complete_a_create_request(
     global: &GlobalScope,
     hash: &CosHash,
+    origin: &ImmutableOrigin,
     requested_origins: Option<RequestedOrigins>,
 ) {
     let _ = global.resource_threads().send(CoreResourceMsg::ToCrossOriginStorage(
         CosThreadMsg::Create(
             hash.clone(),
+            origin.clone(),
             requested_origins,
         ),
     ));
