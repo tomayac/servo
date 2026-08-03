@@ -7,9 +7,11 @@
 //! across every script thread that talks to this resource thread (via
 //! `Arc<RwLock<...>>`, following `FileManager`'s shape in
 //! `filemanager_thread.rs`), and persisted to disk under `config_dir`,
-//! one small file per entry, using the same `servo_base::write_json_to_file`
-//! helper already used for the cookie jar, HSTS list, and auth cache in
-//! `resource_thread.rs`.
+//! one small file per entry, written via `write_file_atomically` (see its
+//! doc comment) rather than the `servo_base::write_json_to_file` helper
+//! used for the cookie jar, HSTS list, and auth cache in
+//! `resource_thread.rs`: a crash or power loss mid-write must never leave
+//! an entry file truncated or half-written.
 //!
 //! `script::dom::crossoriginstorage::registry` is a thin IPC client for
 //! this service, not the source of truth; the actual spec algorithms
@@ -18,12 +20,14 @@
 //! live here.
 //!
 //! Explicitly NOT real:
-//! - Persistence of any one entry is not transactional; two resource
-//!   threads racing to write the *same* entry's file (which should not
-//!   normally happen -- there is one resource thread per Servo instance)
-//!   would not be safe, but that is not a realistic configuration here.
-//!   Different entries' files are fully independent, so this does not
-//!   extend to ordinary concurrent activity across different hashes.
+//! - Two resource threads racing to write the *same* entry's file (which
+//!   should not normally happen -- there is one resource thread per Servo
+//!   instance) would still not be safe: `write_file_atomically` protects
+//!   a reader from ever observing a torn write, not two concurrent
+//!   writers from racing each other to be the one whose write lands last.
+//!   Not a realistic configuration here regardless. Different entries'
+//!   files are fully independent, so this does not extend to ordinary
+//!   concurrent activity across different hashes.
 //!
 //! `Wildcard`-scoped (`origins: '*'`) disclosure uses the real Public
 //! Hash List (PHL): `net_traits::public_hash_list::is_hex_digest_on_public_hash_list`,
@@ -213,6 +217,30 @@ fn entry_metadata_path(config_dir: &Path, key: &str) -> PathBuf {
     config_dir
         .join(ENTRY_BYTES_DIR)
         .join(format!("{}.json", sanitized_entry_key(key)))
+}
+
+/// Writes `contents` to `path` atomically with respect to a crash or
+/// power loss: writes to a sibling temp file first (named after `path`'s
+/// own file name, so two different entries' files can never collide on
+/// the same temp path), then renames it into place. `rename` on the same
+/// filesystem -- guaranteed here, since the temp file is always written
+/// alongside its destination -- is atomic on every platform this needs to
+/// run on, so a reader can never observe a truncated or partially-written
+/// file: `path` is always either its previous complete contents or its
+/// new complete contents, never something in between. Used for both
+/// `persist_entry`'s metadata JSON and `persist_entry_bytes`'s raw bytes.
+fn write_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    let temp_path = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .expect("entry file paths always have a file name")
+            .to_string_lossy()
+    ));
+    if let Err(err) = std::fs::write(&temp_path, contents) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+    std::fs::rename(&temp_path, path)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -597,7 +625,9 @@ impl CrossOriginStorageStore {
     /// Persists one entry's metadata (state, origins, storing-origins,
     /// timestamps) to its own file -- deliberately not entry bytes, which
     /// go through `persist_entry_bytes` instead; see this module's doc
-    /// comment on per-entry persistence.
+    /// comment on per-entry persistence. Written via `write_file_atomically`
+    /// rather than `servo_base::write_json_to_file`, since a crash mid-write
+    /// must never leave a corrupt entry behind.
     fn persist_entry(&self, key: &str, entry: &CosEntry) {
         let Some(dir) = &self.config_dir else {
             return;
@@ -608,8 +638,17 @@ impl CrossOriginStorageStore {
             return;
         }
         let persisted = PersistedEntryRef { key, entry };
-        let filename = format!("{}.json", sanitized_entry_key(key));
-        servo_base::write_json_to_file(&persisted, &entries_dir, &filename);
+        let path = entry_metadata_path(dir, key);
+        let contents = match serde_json::to_vec_pretty(&persisted) {
+            Ok(contents) => contents,
+            Err(err) => {
+                warn!("Could not serialize Cross-Origin Storage entry metadata for {key}: {err}");
+                return;
+            },
+        };
+        if let Err(err) = write_file_atomically(&path, &contents) {
+            warn!("Could not write Cross-Origin Storage entry metadata to {}: {err}", path.display());
+        }
     }
 
     /// Persists one entry's raw bytes to its own file, alongside (not
@@ -626,7 +665,7 @@ impl CrossOriginStorageStore {
                 return;
             }
         }
-        if let Err(err) = std::fs::write(&path, bytes) {
+        if let Err(err) = write_file_atomically(&path, bytes) {
             warn!("Could not write Cross-Origin Storage entry bytes to {}: {err}", path.display());
         }
     }
@@ -2656,6 +2695,34 @@ mod tests {
             reloaded.complete_a_read_request(&small_hash, &a),
             CosReadOutcome::NotFound
         ));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_file_atomically_writes_the_full_contents_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("servo-cos-atomic-write-test-{}", uuid_like_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("entry.json");
+
+        write_file_atomically(&path, b"first").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+
+        // A second write to the same path must fully replace the first
+        // one's contents, not merge with or append to them, and must not
+        // leave its own temp file behind either.
+        write_file_atomically(&path, b"second, and longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second, and longer");
+
+        let leftover_temp_files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+            .collect();
+        assert!(
+            leftover_temp_files.is_empty(),
+            "expected no leftover .tmp files, found {leftover_temp_files:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
