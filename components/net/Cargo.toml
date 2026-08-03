@@ -69,6 +69,7 @@ rustls = { workspace = true, features = ["aws-lc-rs"] }
 rustls-pki-types = { workspace = true }
 rustls-platform-verifier = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 servo-base = { workspace = true }
 servo-config = { workspace = true }
 servo-default-resources = { workspace = true, optional = true }

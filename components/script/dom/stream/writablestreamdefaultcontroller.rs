@@ -1196,56 +1196,6 @@ impl WritableStreamDefaultController {
     }
 
     /// <https://streams.spec.whatwg.org/#writable-stream-default-controller-get-desired-size>
-    /// Resize the accumulated write buffer of a `CrossOriginStorageWrite`
-    /// sink directly, for `FileSystemWritableFileStream::Truncate()`. Not a
-    /// spec algorithm: the real `FileSystemWritableFileStream.truncate()`
-    /// routes through the same underlying-sink write algorithm as
-    /// `write()`/`seek()` (as a `WriteParams`-shaped chunk), which this
-    /// sink does not model. Bypassing the write-queue like this means a
-    /// `truncate()` racing a concurrent queued `write()` is not ordered
-    /// the way the spec requires; acceptable for this sink given nothing
-    /// in this codebase issues concurrent writes against one handle.
-    ///
-    /// # Panics
-    /// If `self`'s underlying sink is not `CrossOriginStorageWrite`. Only
-    /// call this on a controller known to back a
-    /// `FileSystemWritableFileStream`.
-    pub(crate) fn cross_origin_storage_truncate(&self, size: usize) {
-        match &self.underlying_sink_type {
-            UnderlyingSinkType::CrossOriginStorageWrite { bytes, position, .. } => {
-                bytes.borrow_mut().resize(size, 0);
-                // <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-truncate>
-                // "If writable's [[position]] is greater than size, set
-                // writable's [[position]] to size."
-                if position.get() > size {
-                    position.set(size);
-                }
-            },
-            _ => unreachable!(
-                "cross_origin_storage_truncate called on a non-CrossOriginStorageWrite sink"
-            ),
-        }
-    }
-
-    /// Sets the `[[position]]` slot directly, for
-    /// `FileSystemWritableFileStream::Seek()`. See the `position` field's
-    /// doc comment on `UnderlyingSinkType::CrossOriginStorageWrite`.
-    ///
-    /// # Panics
-    /// If `self`'s underlying sink is not `CrossOriginStorageWrite`. Only
-    /// call this on a controller known to back a
-    /// `FileSystemWritableFileStream`.
-    pub(crate) fn cross_origin_storage_seek(&self, new_position: usize) {
-        match &self.underlying_sink_type {
-            UnderlyingSinkType::CrossOriginStorageWrite { position, .. } => {
-                position.set(new_position);
-            },
-            _ => unreachable!(
-                "cross_origin_storage_seek called on a non-CrossOriginStorageWrite sink"
-            ),
-        }
-    }
-
     pub(crate) fn get_desired_size(&self) -> f64 {
         // Return controller.[[strategyHWM]] − controller.[[queueTotalSize]].
         let desired_size = self.strategy_hwm - self.queue.total_size.get().clamp(0.0, f64::MAX);

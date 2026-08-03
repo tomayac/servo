@@ -6,9 +6,9 @@
 //! (<https://wicg.github.io/cross-origin-storage/#cos-entries>): shared
 //! across every script thread that talks to this resource thread (via
 //! `Arc<RwLock<...>>`, following `FileManager`'s shape in
-//! `filemanager_thread.rs`), and persisted to disk under `config_dir`
-//! using the same `servo_base::read_json_from_file` / `write_json_to_file`
-//! helpers already used for the cookie jar, HSTS list, and auth cache in
+//! `filemanager_thread.rs`), and persisted to disk under `config_dir`,
+//! one small file per entry, using the same `servo_base::write_json_to_file`
+//! helper already used for the cookie jar, HSTS list, and auth cache in
 //! `resource_thread.rs`.
 //!
 //! `script::dom::crossoriginstorage::registry` is a thin IPC client for
@@ -18,12 +18,12 @@
 //! live here.
 //!
 //! Explicitly NOT real:
-//! - Persistence is whole-registry-metadata read-on-startup /
-//!   write-on-every-mutation JSON (see below for why entry *bytes* are
-//!   not part of that), not incremental or transactional; two resource
-//!   threads racing to write the same file (which should not normally
-//!   happen -- there is one resource thread per Servo instance) would not
-//!   be safe, but that is not a realistic configuration here.
+//! - Persistence of any one entry is not transactional; two resource
+//!   threads racing to write the *same* entry's file (which should not
+//!   normally happen -- there is one resource thread per Servo instance)
+//!   would not be safe, but that is not a realistic configuration here.
+//!   Different entries' files are fully independent, so this does not
+//!   extend to ordinary concurrent activity across different hashes.
 //!
 //! `Wildcard`-scoped (`origins: '*'`) disclosure uses the real Public
 //! Hash List (PHL): `net_traits::public_hash_list::is_hex_digest_on_public_hash_list`,
@@ -58,9 +58,9 @@
 //! `WRITE_BUDGET_CAPACITY`'s doc comment for why writes get a smaller,
 //! slower budget than reads), since a `create()` is the first step of a
 //! write attempt and unbounded `create()` calls are still real registry
-//! churn and disk I/O (each one that needs a fresh entry persists the
-//! whole registry file) worth bounding, independent of whether they are
-//! ever observable to the calling script.
+//! churn and disk I/O (each one that needs a fresh entry persists its own
+//! entry file) worth bounding, independent of whether they are ever
+//! observable to the calling script.
 //!
 //! `verify_and_store` also enforces a storage budget, not spec-mandated
 //! (the explainer only mentions LRU-based eviction under storage
@@ -97,15 +97,21 @@
 //! different origins), while `https://example.com` and
 //! `https://example.co.uk` are not, despite superficially similar names.
 //!
-//! Entry bytes live in their own per-entry file under
-//! `config_dir/cos_entries/`, not inline in the registry JSON: `persist()`
-//! serializes and writes the *entire* registry metadata on every single
-//! mutation (every `create` and every `close()`), so embedding entry
-//! content there would make every unrelated future write's cost scale
-//! with the total size of every large entry ever stored, unboundedly.
-//! Keeping bytes in their own file makes `persist()`'s cost proportional
-//! to the number of entries, not their total size, and means writing one
-//! entry never implies rewriting any other one.
+//! Every entry lives under `config_dir/cos_entries/` as a pair of sibling
+//! files, both named after `registry_key()`'s sanitized form: `<key>.json`
+//! (metadata -- state, origins, storing-origins, timestamps; written by
+//! `persist_entry()`) and `<key>.bin` (raw bytes, written by
+//! `persist_entry_bytes()`, only for a `Written` entry). Keeping bytes out
+//! of the metadata file means a mutation that only touches metadata (e.g.
+//! a fresh `Pending` entry from `complete_a_create_request`) never has to
+//! rewrite any entry's bytes, and vice versa. Splitting metadata itself
+//! into one file per entry (rather than one JSON blob for the whole
+//! registry) means `persist_entry()`'s cost is proportional to the size
+//! of the one entry that actually changed, not the number of entries in
+//! the registry -- writing or reading back one entry never implies
+//! touching any other one. `CrossOriginStorageStore::new()` loads the
+//! registry back by scanning this directory for `.json` files rather than
+//! reading one combined file.
 //!
 //! A `Pending` entry (created by `complete a create request`, before the
 //! matching `close()`/`verify_and_store` ever runs) can be abandoned:
@@ -137,31 +143,25 @@
 //! being re-declared in a merge does *not* move it: only an actual read
 //! refreshes recency, so a writer can't keep a dormant origin artificially
 //! "alive" just by repeatedly re-declaring it without it ever being used.
-//! The touch itself is not separately persisted to disk (seeing this
-//! module's doc comment above on `persist()`'s whole-registry write cost
-//! -- doing so on every single read would mean a disk write per read, not
-//! just per mutation); it piggybacks on whatever the next real mutation's
-//! persist happens to be, so exact recency ordering is only guaranteed
-//! within one running session, falling back to the last-persisted order
-//! across a restart. That is an acceptable soft-fairness degradation, not
-//! a correctness issue: the length cap itself is still always enforced
-//! regardless of persistence timing.
+//! The touch is persisted immediately (`complete_a_read_request` calls
+//! `persist_entry()` after it, alongside the `last_read_unix_secs` update
+//! below), which is affordable now that a mutation's persistence cost is
+//! proportional to the one entry touched, not the whole registry (see
+//! this module's doc comment on per-entry persistence).
 //!
 //! `CosEntry::last_read_unix_secs` is a *separate* recency signal from
 //! the origins-list order above: it tracks how recently an *entry*
 //! (rather than an origin within one entry's list) was last read, and
 //! drives storage-budget eviction order (`evict_sole_owned_entries_for_origin`,
-//! `evict_globally_lru`) instead of the origins-list length cap. Unlike
-//! the origins-list touch, this one is a plain wall-clock timestamp
-//! (persisted as part of the same registry JSON, `#[serde(default)]` for
-//! forward compatibility with a registry saved before this field
-//! existed) rather than a reordered `Vec`, since eviction here deletes
-//! real stored bytes -- a more consequential action than reordering a
-//! visibility list -- so it is worth persisting precisely rather than
-//! only "soft, in-memory-first" the way the origins-list touch is; it is
-//! still only updated on a genuine `Found` read, for the same reason as
-//! the origins-list touch (an entry being merely re-verified by a writer
-//! is not the same as being read).
+//! `evict_globally_lru`) instead of the origins-list length cap. It is a
+//! plain wall-clock timestamp (`#[serde(default)]` for forward
+//! compatibility with a registry saved before this field existed), set
+//! and persisted by `complete_a_read_request` on every genuine `Found`
+//! read, so eviction order survives a restart accurately instead of
+//! reflecting whenever the entry was last *written*. It is still only
+//! updated on a genuine `Found` read, not a write: an entry being merely
+//! re-verified by a writer is not the same as being read by some other
+//! origin.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -178,7 +178,6 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use servo_url::ImmutableOrigin;
 
-const PERSISTED_FILENAME: &str = "cross_origin_storage_registry.json";
 const ENTRY_BYTES_DIR: &str = "cos_entries";
 
 /// How long a `Pending` entry is left alone before `complete_a_read_request`
@@ -193,14 +192,29 @@ fn unix_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Path of the on-disk file holding one entry's raw bytes. `key` is
-/// `registry_key()`'s `"ALGORITHM:hex_value"` form; `:` is replaced since
-/// it is not a safe filename character on every platform this needs to
-/// run on.
+/// `key` (`registry_key()`'s `"ALGORITHM:hex_value"` form) with `:`
+/// replaced, since it is not a safe filename character on every platform
+/// this needs to run on. Shared basename for both an entry's bytes file
+/// and its metadata file; see `entry_bytes_path`/`entry_metadata_path`.
+fn sanitized_entry_key(key: &str) -> String {
+    key.replace(':', "_")
+}
+
+/// Path of the on-disk file holding one entry's raw bytes; see this
+/// module's doc comment on per-entry persistence.
 fn entry_bytes_path(config_dir: &Path, key: &str) -> PathBuf {
     config_dir
         .join(ENTRY_BYTES_DIR)
-        .join(format!("{}.bin", key.replace(':', "_")))
+        .join(format!("{}.bin", sanitized_entry_key(key)))
+}
+
+/// Path of the on-disk file holding one entry's metadata (a
+/// `PersistedEntry`); see this module's doc comment on per-entry
+/// persistence.
+fn entry_metadata_path(config_dir: &Path, key: &str) -> PathBuf {
+    config_dir
+        .join(ENTRY_BYTES_DIR)
+        .join(format!("{}.json", sanitized_entry_key(key)))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -257,14 +271,42 @@ fn is_stale_pending(entry: &CosEntry) -> bool {
         unix_now_secs().saturating_sub(entry.pending_since_unix_secs) > PENDING_ENTRY_STALE_AFTER_SECS
 }
 
-/// The persisted (and in-memory) registry contents. `HashMap` keys here
-/// are plain `String`s (the hash's normalized `"ALGORITHM:value"` form),
-/// not the `(String, String)` tuple used internally elsewhere in this
-/// codebase's COS work: `serde_json` cannot serialize a tuple as a JSON
-/// object key, only a plain string.
-#[derive(Default, Deserialize, Serialize)]
+/// The in-memory registry contents. `HashMap` keys here are plain
+/// `String`s (the hash's normalized `"ALGORITHM:value"` form), not the
+/// `(String, String)` tuple used internally elsewhere in this codebase's
+/// COS work: `serde_json` cannot serialize a tuple as a JSON object key,
+/// only a plain string. Never serialized as a whole; see this module's
+/// doc comment on per-entry persistence -- `PersistedEntry` is the unit
+/// that actually round-trips through JSON.
+#[derive(Default)]
 struct CosRegistryData {
     entries: HashMap<String, CosEntry>,
+}
+
+/// On-disk shape of one entry's metadata file (`entry_metadata_path()`),
+/// for reading it back. Bundles the registry key alongside the entry
+/// itself since a standalone per-entry file has nowhere else to record
+/// which hash it belongs to (unlike a whole-registry file, where the key
+/// would be the surrounding JSON object's field name) --
+/// `CrossOriginStorageStore::new()` needs it back to reconstruct the
+/// in-memory `HashMap`'s key when scanning `cos_entries/` on startup. See
+/// `PersistedEntryRef` for the write side.
+#[derive(Deserialize)]
+struct PersistedEntry {
+    key: String,
+    entry: CosEntry,
+}
+
+/// Reference-only counterpart of `PersistedEntry`, used by
+/// `persist_entry()` to write an entry's metadata without cloning its
+/// (potentially large, e.g. multi-hundred-MiB AI model weights)
+/// in-memory bytes first -- `StoredEntryBytes::bytes` is `#[serde(skip)]`
+/// regardless, but a `CosEntry::clone()` would still physically copy
+/// that `Vec<u8>` before serialization ever got the chance to skip it.
+#[derive(Serialize)]
+struct PersistedEntryRef<'a> {
+    key: &'a str,
+    entry: &'a CosEntry,
 }
 
 fn registry_key(hash: &CosHash) -> String {
@@ -387,17 +429,66 @@ pub struct CrossOriginStorageStore {
 
 impl CrossOriginStorageStore {
     pub fn new(config_dir: Option<PathBuf>) -> Self {
-        let mut data = CosRegistryData::default();
+        let mut entries = HashMap::new();
         if let Some(dir) = &config_dir {
-            servo_base::read_json_from_file(&mut data, dir, PERSISTED_FILENAME);
-            // The registry JSON only records *that* a written entry has
-            // bytes (via `Some(StoredEntryBytes)`), not the bytes
-            // themselves -- load each one back from its own file now.
-            for (key, entry) in data.entries.iter_mut() {
-                if entry.bytes.is_none() {
+            entries = Self::load_entries_from_disk(dir);
+        }
+        let data = CosRegistryData { entries };
+        CrossOriginStorageStore {
+            data: Arc::new(RwLock::new(data)),
+            config_dir,
+            probe_budgets: Arc::new(Mutex::new(HashMap::new())),
+            write_budgets: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            fake_free_disk_space: None,
+            #[cfg(test)]
+            fake_total_disk_space: None,
+        }
+    }
+
+    /// Loads the registry back by scanning `dir/cos_entries/` for `.json`
+    /// metadata files (see this module's doc comment on per-entry
+    /// persistence), rather than reading one combined file. A file that
+    /// can't be read or decoded is skipped with a warning -- one corrupt
+    /// entry must not prevent every other entry from loading.
+    fn load_entries_from_disk(dir: &Path) -> HashMap<String, CosEntry> {
+        let mut entries = HashMap::new();
+        let read_dir = match std::fs::read_dir(dir.join(ENTRY_BYTES_DIR)) {
+            Ok(read_dir) => read_dir,
+            // No entries have ever been persisted yet -- an empty
+            // registry, not a warning-worthy problem.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return entries,
+            Err(err) => {
+                warn!("Could not read {}: {err}", dir.join(ENTRY_BYTES_DIR).display());
+                return entries;
+            },
+        };
+        for dir_entry in read_dir.flatten() {
+            let path = dir_entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let contents = match std::fs::read_to_string(&path) {
+                Ok(contents) => contents,
+                Err(err) => {
+                    warn!("Could not read Cross-Origin Storage entry metadata at {}: {err}", path.display());
                     continue;
-                }
-                match std::fs::read(entry_bytes_path(dir, key)) {
+                },
+            };
+            let persisted: PersistedEntry = match serde_json::from_str(&contents) {
+                Ok(persisted) => persisted,
+                Err(err) => {
+                    warn!("Could not decode Cross-Origin Storage entry metadata at {}: {err}", path.display());
+                    continue;
+                },
+            };
+            let PersistedEntry { key, mut entry } = persisted;
+            // The metadata file only records *that* a written entry has
+            // bytes (via `Some(StoredEntryBytes)`), not the bytes
+            // themselves -- load each one back from its own sibling file
+            // now.
+            if entry.bytes.is_some() {
+                match std::fs::read(entry_bytes_path(dir, &key)) {
                     Ok(bytes) => {
                         if let Some(stored) = entry.bytes.as_mut() {
                             stored.bytes = bytes;
@@ -413,17 +504,9 @@ impl CrossOriginStorageStore {
                     },
                 }
             }
+            entries.insert(key, entry);
         }
-        CrossOriginStorageStore {
-            data: Arc::new(RwLock::new(data)),
-            config_dir,
-            probe_budgets: Arc::new(Mutex::new(HashMap::new())),
-            write_budgets: Arc::new(Mutex::new(HashMap::new())),
-            #[cfg(test)]
-            fake_free_disk_space: None,
-            #[cfg(test)]
-            fake_total_disk_space: None,
-        }
+        entries
     }
 
     /// <https://wicg.github.io/cross-origin-storage/#read-requests> notes
@@ -515,18 +598,27 @@ impl CrossOriginStorageStore {
         self.fake_total_disk_space = Some(bytes);
     }
 
-    /// Persists registry *metadata* (state, origins, storing-origins) --
-    /// deliberately not entry bytes; see this module's doc comment.
-    fn persist(&self, data: &CosRegistryData) {
-        if let Some(dir) = &self.config_dir {
-            servo_base::write_json_to_file(data, dir, PERSISTED_FILENAME);
+    /// Persists one entry's metadata (state, origins, storing-origins,
+    /// timestamps) to its own file -- deliberately not entry bytes, which
+    /// go through `persist_entry_bytes` instead; see this module's doc
+    /// comment on per-entry persistence.
+    fn persist_entry(&self, key: &str, entry: &CosEntry) {
+        let Some(dir) = &self.config_dir else {
+            return;
+        };
+        let entries_dir = dir.join(ENTRY_BYTES_DIR);
+        if let Err(err) = std::fs::create_dir_all(&entries_dir) {
+            warn!("Could not create {}: {err}", entries_dir.display());
+            return;
         }
+        let persisted = PersistedEntryRef { key, entry };
+        let filename = format!("{}.json", sanitized_entry_key(key));
+        servo_base::write_json_to_file(&persisted, &entries_dir, &filename);
     }
 
-    /// Persists one entry's raw bytes to its own file. Called instead of
-    /// (not in addition to some inline JSON representation of) storing
-    /// them as part of `persist()`'s registry-wide write; see this
-    /// module's doc comment for why.
+    /// Persists one entry's raw bytes to its own file, alongside (not
+    /// combined with) its metadata; see `persist_entry` and this module's
+    /// doc comment on per-entry persistence.
     fn persist_entry_bytes(&self, key: &str, bytes: &[u8]) {
         let Some(dir) = &self.config_dir else {
             return;
@@ -581,7 +673,8 @@ impl CrossOriginStorageStore {
         // this needs mutable access even though it's conceptually "just
         // a read" from the caller's perspective.
         let mut data = self.data.write();
-        let Some(entry) = data.entries.get_mut(&registry_key(hash)) else {
+        let key = registry_key(hash);
+        let Some(entry) = data.entries.get_mut(&key) else {
             return CosReadOutcome::NotFound;
         };
 
@@ -600,9 +693,6 @@ impl CrossOriginStorageStore {
             return CosReadOutcome::NotFound;
         }
 
-        // Not persisted immediately; see this module's doc comment on
-        // why both LRU touches below are soft, in-memory-first
-        // mechanisms.
         touch_listed_origin(entry, origin);
         if entry.bytes.is_some() {
             // Drives storage-budget eviction order; see this module's
@@ -611,6 +701,12 @@ impl CrossOriginStorageStore {
             // access to `entry` doesn't overlap with `entry.bytes`'s
             // shared borrow there.
             entry.last_read_unix_secs = unix_now_secs();
+            // Persisted immediately, alongside the origins-list touch
+            // above: see this module's doc comment on per-entry
+            // persistence and on `last_read_unix_secs` for why this is
+            // now affordable and necessary for eviction order to survive
+            // a restart accurately.
+            self.persist_entry(&key, entry);
         }
 
         match &entry.bytes {
@@ -665,23 +761,24 @@ impl CrossOriginStorageStore {
             Some(existing) => is_stale_pending(existing),
         };
         if needs_fresh_entry {
-            data.entries.insert(key, CosEntry {
+            let entry = CosEntry {
                 bytes: None,
                 state: CosEntryState::Pending,
                 origins: normalized,
                 storing_origins: HashSet::new(),
                 pending_since_unix_secs: unix_now_secs(),
                 last_read_unix_secs: unix_now_secs(),
-            });
+            };
             // Only persisted when something actually changed: unlike
             // `verify_and_store`, a repeated `create()` call for a hash
             // that already has a fresh entry is a legitimate, common,
             // idempotent no-op (the same handle-obtaining call a page
-            // might make many times for the same hash), and rewriting
-            // the whole registry file for it every time would be a real,
-            // needless disk-I/O cost with no corresponding state change
-            // to justify it.
-            self.persist(&data);
+            // might make many times for the same hash), and writing an
+            // entry file for it every time would be a real, needless
+            // disk-I/O cost with no corresponding state change to
+            // justify it.
+            self.persist_entry(&key, &entry);
+            data.entries.insert(key, entry);
         }
     }
 
@@ -695,7 +792,7 @@ impl CrossOriginStorageStore {
         // survive this abort.
         if matches!(data.entries.get(&key), Some(entry) if entry.state == CosEntryState::Pending) {
             data.entries.remove(&key);
-            self.persist(&data);
+            delete_entry_metadata_file(self.config_dir.as_deref(), &key);
         }
     }
 
@@ -754,14 +851,12 @@ impl CrossOriginStorageStore {
                     needed,
                 );
                 if origin_storage_usage(&data, &origin) + new_bytes_len > share {
-                    // Persisted even on rejection: eviction above already
-                    // removed entries and deleted their on-disk byte
-                    // files, so the registry metadata must be saved to
-                    // match -- otherwise a restart before any later
-                    // successful mutation would leave stale entries in
-                    // the persisted JSON pointing at byte files that no
-                    // longer exist.
-                    self.persist(&data);
+                    // Eviction above already removed entries and deleted
+                    // both their on-disk byte and metadata files
+                    // per-entry as it went (see `evict_sole_owned_entries_for_origin`),
+                    // so nothing further needs persisting here on
+                    // rejection; see this module's doc comment on
+                    // per-entry persistence.
                     return VerifyAndStoreOutcome::QuotaExceeded {
                         quota_bytes: share,
                         requested_bytes: new_bytes_len,
@@ -776,7 +871,6 @@ impl CrossOriginStorageStore {
             evict_globally_lru(&mut data, self.config_dir.as_deref(), needed);
             if total_bytes_used(&data) + new_bytes_len > budget {
                 // Same reasoning as the per-origin-share rejection above.
-                self.persist(&data);
                 return VerifyAndStoreOutcome::QuotaExceeded {
                     quota_bytes: budget,
                     requested_bytes: new_bytes_len,
@@ -803,7 +897,6 @@ impl CrossOriginStorageStore {
             let needed = new_bytes_len - self.query_free_disk_space();
             evict_globally_lru(&mut data, self.config_dir.as_deref(), needed);
             if new_bytes_len > self.query_free_disk_space() {
-                self.persist(&data);
                 return VerifyAndStoreOutcome::QuotaExceeded {
                     quota_bytes: budget,
                     requested_bytes: new_bytes_len,
@@ -815,7 +908,7 @@ impl CrossOriginStorageStore {
 
         let entry = data
             .entries
-            .entry(key)
+            .entry(key.clone())
             .or_insert_with(|| CosEntry {
                 bytes: None,
                 state: CosEntryState::Pending,
@@ -830,7 +923,7 @@ impl CrossOriginStorageStore {
         entry.last_read_unix_secs = unix_now_secs();
         entry.storing_origins.insert(origin);
         upgrade_resource_visibility(entry, requested_origins);
-        self.persist(&data);
+        self.persist_entry(&key, entry);
 
         VerifyAndStoreOutcome::Success
     }
@@ -1041,6 +1134,7 @@ fn evict_sole_owned_entries_for_origin(
         }
         data.entries.remove(&key);
         delete_entry_bytes_file(config_dir, &key);
+        delete_entry_metadata_file(config_dir, &key);
         freed += size;
     }
 }
@@ -1072,6 +1166,7 @@ fn evict_globally_lru(data: &mut CosRegistryData, config_dir: Option<&Path>, byt
         }
         data.entries.remove(&key);
         delete_entry_bytes_file(config_dir, &key);
+        delete_entry_metadata_file(config_dir, &key);
         freed += size;
     }
 }
@@ -1090,6 +1185,29 @@ fn delete_entry_bytes_file(config_dir: Option<&Path>, key: &str) {
         if err.kind() != std::io::ErrorKind::NotFound {
             warn!(
                 "Could not delete evicted Cross-Origin Storage entry bytes at {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Deletes an evicted (or abandoned) entry's per-entry metadata file, if
+/// `config_dir` is set; the sibling of `delete_entry_bytes_file`. Called
+/// immediately as part of eviction/abandonment itself (rather than
+/// deferred to some later whole-registry persist) now that each entry's
+/// metadata is its own file; see this module's doc comment on per-entry
+/// persistence. A missing file is not a warning-worthy problem; any other
+/// error is, since it means an entry that should be gone is still
+/// discoverable on the next `CrossOriginStorageStore::new()`.
+fn delete_entry_metadata_file(config_dir: Option<&Path>, key: &str) {
+    let Some(dir) = config_dir else {
+        return;
+    };
+    let path = entry_metadata_path(dir, key);
+    if let Err(err) = std::fs::remove_file(&path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                "Could not delete evicted Cross-Origin Storage entry metadata at {}: {err}",
                 path.display()
             );
         }
@@ -2110,6 +2228,80 @@ mod tests {
     }
 
     #[test]
+    fn a_genuine_read_persists_last_read_unix_secs_so_it_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("servo-cos-registry-test-{}", uuid_like_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let older_bytes = b"written-first".to_vec();
+        let older_hex = compute_hex_digest("SHA-256", &older_bytes).unwrap();
+        let older_hash = hash("SHA-256", &older_hex);
+
+        let newer_bytes = b"written-second".to_vec();
+        let newer_hex = compute_hex_digest("SHA-256", &newer_bytes).unwrap();
+        let newer_hash = hash("SHA-256", &newer_hex);
+
+        let writer = origin("https://writer.example");
+
+        {
+            let store = CrossOriginStorageStore::new(Some(dir.clone()));
+            assert!(matches!(
+                store.verify_and_store(
+                    &older_hash,
+                    older_bytes,
+                    "text/plain".to_owned(),
+                    writer.clone(),
+                    None
+                ),
+                VerifyAndStoreOutcome::Success
+            ));
+
+            // 1-second `unix_now_secs()`/mtime resolution: sleep long
+            // enough between each step that the timestamps below are
+            // observably ordered.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+
+            assert!(matches!(
+                store.verify_and_store(
+                    &newer_hash,
+                    newer_bytes,
+                    "text/plain".to_owned(),
+                    writer.clone(),
+                    None
+                ),
+                VerifyAndStoreOutcome::Success
+            ));
+
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+
+            // Read the entry that was written *first*, well after the
+            // other one was written -- if the read is correctly
+            // persisted, this makes the first-written entry the more
+            // recently *used* one, the opposite of write order.
+            match store.complete_a_read_request(&older_hash, &writer) {
+                CosReadOutcome::Found { .. } => {},
+                other => panic!("expected the older entry to be found, got {other:?}"),
+            }
+        }
+
+        // A fresh store, loaded from disk only: without persisting the
+        // read above, `last_read_unix_secs` would only ever reflect each
+        // entry's *write* time, so the second-written entry would
+        // incorrectly look like the more recently used one here.
+        let reloaded = CrossOriginStorageStore::new(Some(dir.clone()));
+        let data = reloaded.data.read();
+        let older_last_read = data.entries.get(&registry_key(&older_hash)).unwrap().last_read_unix_secs;
+        let newer_last_read = data.entries.get(&registry_key(&newer_hash)).unwrap().last_read_unix_secs;
+        assert!(
+            older_last_read > newer_last_read,
+            "expected the entry read most recently to have the greater persisted \
+             last_read_unix_secs even though it was written first \
+             (older_last_read={older_last_read}, newer_last_read={newer_last_read})"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn storage_budget_is_60_percent_of_total_disk_space() {
         assert_eq!(storage_budget(1000), 600);
         assert_eq!(storage_budget(0), 0);
@@ -2339,8 +2531,8 @@ mod tests {
         let h = hash("SHA-256", &"7".repeat(64));
 
         store.complete_a_create_request(&h, &creator, None);
-        let registry_path = dir.join(PERSISTED_FILENAME);
-        let mtime_after_first_create = std::fs::metadata(&registry_path).unwrap().modified().unwrap();
+        let entry_path = entry_metadata_path(&dir, &registry_key(&h));
+        let mtime_after_first_create = std::fs::metadata(&entry_path).unwrap().modified().unwrap();
 
         // Some filesystems only have 1-second mtime resolution; wait
         // long enough that a real rewrite would produce an observably
@@ -2348,10 +2540,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
 
         // A second create() for the same hash, which already has a
-        // fresh Pending entry, is a genuine no-op -- the registry file
+        // fresh Pending entry, is a genuine no-op -- its entry file
         // must not be rewritten for it.
         store.complete_a_create_request(&h, &creator, None);
-        let mtime_after_second_create = std::fs::metadata(&registry_path).unwrap().modified().unwrap();
+        let mtime_after_second_create = std::fs::metadata(&entry_path).unwrap().modified().unwrap();
 
         assert_eq!(mtime_after_first_create, mtime_after_second_create);
 

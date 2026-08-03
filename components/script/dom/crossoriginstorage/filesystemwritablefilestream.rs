@@ -39,23 +39,34 @@
 //! `seek()` sets the position directly (a later `write()` past the
 //! current end of the buffer zero-pads the gap, matching the spec's
 //! "write command" algorithm); `truncate()` resizes the buffer and
-//! clamps the position down if it now exceeds the new size. See
-//! `WritableStreamDefaultController::cross_origin_storage_seek` and
-//! `cross_origin_storage_truncate`.
+//! clamps the position down if it now exceeds the new size. Per
+//! <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-seek>
+//! and `-truncate`, both are defined the same way as `write()`: acquire a
+//! writer, write a `WriteParams`-shaped chunk (`{type, position}` /
+//! `{type, size}`), release the writer's lock -- so a `seek()`/
+//! `truncate()` takes its turn in the writer's queue alongside any other
+//! queued `write()` calls on the same stream, rather than applying out of
+//! order. See `write_params_chunk()` below.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
+use js::conversions::ToJSValConvertible;
+use js::jsapi::Heap;
+use js::jsval::UndefinedValue;
 use js::realm::CurrentRealm;
 use js::rust::HandleValue as SafeHandleValue;
 use script_bindings::reflector::reflect_dom_object_with_cx;
 use servo_url::ImmutableOrigin;
 
-use crate::dom::bindings::codegen::Bindings::FileSystemWritableFileStreamBinding::FileSystemWritableFileStreamMethods;
+use crate::dom::bindings::codegen::Bindings::FileSystemWritableFileStreamBinding::{
+    FileSystemWritableFileStreamMethods, WriteCommandType, WriteParams,
+};
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
-use crate::dom::bindings::error::{Error, Fallible};
+use crate::dom::bindings::error::Fallible;
 use crate::dom::bindings::root::DomRoot;
+use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::crossoriginstorage::hash::CosHash;
 use crate::dom::crossoriginstorage::registry::RequestedOrigins;
 use crate::dom::globalscope::GlobalScope;
@@ -154,35 +165,49 @@ impl FileSystemWritableFileStreamMethods<crate::DomTypeHolder> for FileSystemWri
 
     /// <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-seek>
     fn Seek(&self, realm: &mut CurrentRealm, position: u64) -> Rc<Promise> {
-        let global = GlobalScope::from_current_realm(realm);
-        let promise = Promise::new(realm, &global);
-        if !self.writable_stream.is_writable() {
-            promise.reject_error(realm, Error::Type(c"Stream is not writable".to_owned()));
-            return promise;
-        }
-        let Some(controller) = self.writable_stream.get_controller() else {
-            promise.reject_error(realm, Error::Type(c"Stream has no controller".to_owned()));
-            return promise;
+        let params = WriteParams {
+            data: RootedTraceableBox::from_box(Heap::boxed(UndefinedValue())),
+            position: Some(Some(position)),
+            size: None,
+            type_: WriteCommandType::Seek,
         };
-        controller.cross_origin_storage_seek(position as usize);
-        promise.resolve_native(realm, &());
-        promise
+        write_params_chunk(self, realm, params)
     }
 
     /// <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-truncate>
     fn Truncate(&self, realm: &mut CurrentRealm, size: u64) -> Rc<Promise> {
-        let global = GlobalScope::from_current_realm(realm);
-        let promise = Promise::new(realm, &global);
-        if !self.writable_stream.is_writable() {
-            promise.reject_error(realm, Error::Type(c"Stream is not writable".to_owned()));
-            return promise;
-        }
-        let Some(controller) = self.writable_stream.get_controller() else {
-            promise.reject_error(realm, Error::Type(c"Stream has no controller".to_owned()));
-            return promise;
+        let params = WriteParams {
+            data: RootedTraceableBox::from_box(Heap::boxed(UndefinedValue())),
+            position: None,
+            size: Some(Some(size)),
+            type_: WriteCommandType::Truncate,
         };
-        controller.cross_origin_storage_truncate(size as usize);
-        promise.resolve_native(realm, &());
-        promise
+        write_params_chunk(self, realm, params)
     }
+}
+
+/// Shared by `Seek()`/`Truncate()`: builds a `WriteParams`-shaped JS value
+/// and writes it through the stream's writer, exactly like `Write()` does
+/// for a bare chunk, so a `seek()`/`truncate()` call takes its place in
+/// write order rather than mutating `[[position]]`/the byte buffer out of
+/// band with an in-flight `write()`.
+fn write_params_chunk(
+    stream: &FileSystemWritableFileStream,
+    realm: &mut CurrentRealm,
+    params: WriteParams,
+) -> Rc<Promise> {
+    let global = GlobalScope::from_current_realm(realm);
+    rooted!(&in(realm) let mut chunk = UndefinedValue());
+    params.safe_to_jsval(realm.as_mut(), chunk.handle_mut());
+    let writer = match stream.writable_stream.aquire_default_writer(realm, &global) {
+        Ok(writer) => writer,
+        Err(error) => {
+            let promise = Promise::new(realm, &global);
+            promise.reject_error(realm, error);
+            return promise;
+        },
+    };
+    let promise = writer.write(realm, &global, chunk.handle());
+    writer.release(realm, &global);
+    promise
 }
