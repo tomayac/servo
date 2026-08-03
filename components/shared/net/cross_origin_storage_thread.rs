@@ -91,6 +91,38 @@ pub enum RequestedOrigins {
     List(Vec<ImmutableOrigin>),
 }
 
+/// The `origins` option's implementation-defined maximum list length,
+/// per <https://wicg.github.io/cross-origin-storage/#normalize-requested-origins>:
+/// "A list of origin strings has an implementation-defined maximum
+/// length, so it can't be used as an undeclared substitute for `'*'`."
+///
+/// One shared constant for two different checks, matching the spec's
+/// own singular framing ("an implementation-defined maximum length", not
+/// two separate ones):
+/// - `script::dom::crossoriginstorage::crossoriginstoragemanager::RequestFileHandle`
+///   rejects a single call's own `options.origins` with a `TypeError`
+///   if it exceeds this on its own, before any write is attempted, per
+///   "If `origins` is a list longer than [this], the user agent must
+///   throw a `TypeError` before attempting any write."
+/// - `net::cross_origin_storage_thread::upgrade_resource_visibility`
+///   instead silently drops the least-recently-used excess origins when
+///   *merging* a new call's candidates into an already-list-scoped entry
+///   would exceed this, per "Merging `origins` into an existing
+///   list-scoped entry would exceed the implementation-defined maximum
+///   length [results in] Success (excess origins silently dropped)".
+///   This can legitimately happen without any single caller doing
+///   anything wrong: independent, unrelated origins can each write the
+///   same byte-identical resource with their own small `origins` list
+///   (e.g. a shared open-source asset), and those lists merge over time.
+///
+/// 100 is this implementation's choice (the spec gives no number):
+/// generous enough that no single realistic declaration, or a few
+/// rounds of organic multi-writer merge growth, would plausibly hit it,
+/// while remaining far too small to function as a practical `'*'`
+/// substitute (that would take dozens of *separate* legitimate write
+/// events, each contributing genuinely new origins).
+pub const MAX_ORIGINS_LIST_LENGTH: usize = 100;
+
 /// The result of `complete a read request`
 /// (<https://wicg.github.io/cross-origin-storage/#complete-a-read-request>),
 /// sent back over IPC.

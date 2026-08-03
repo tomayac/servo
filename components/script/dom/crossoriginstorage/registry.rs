@@ -37,7 +37,7 @@
 use std::rc::Rc;
 use std::time::SystemTime;
 
-pub(crate) use net_traits::cross_origin_storage_thread::RequestedOrigins;
+pub(crate) use net_traits::cross_origin_storage_thread::{MAX_ORIGINS_LIST_LENGTH, RequestedOrigins};
 
 use net_traits::CoreResourceMsg;
 use net_traits::cross_origin_storage_thread::{CosReadOutcome, CosThreadMsg};

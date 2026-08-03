@@ -44,6 +44,20 @@
 //! where a spurious re-download would be expensive and itself
 //! observable -- see `should_grease`'s doc comment).
 //!
+//! Every `complete a read request` call is also a probe (per the
+//! explainer's own framing: "Each call to `requestFileHandle()` can be
+//! considered a probe"), since its `Found`/`NotFound`/`PendingWrite`
+//! outcome is directly observable by the calling script -- an origin
+//! could otherwise brute-force many hashes to fingerprint what is
+//! cross-origin-cached. `consume_probe_token` rate-limits this per
+//! requesting origin with a token bucket (see its doc comment for the
+//! capacity/refill numbers and reasoning); over budget, the call is
+//! answered with `NotFound` the same way GREASE'ing lies, so hitting the
+//! limit is not itself an observable signal. `complete_a_create_request`
+//! is deliberately NOT budgeted the same way: it has no return value at
+//! all (see its own doc comment), so it carries no directly observable
+//! signal for an origin to probe with today.
+//!
 //! `SameSiteOnly` disclosure uses `net_traits::pub_domains::is_same_site`
 //! (Public Suffix List-backed eTLD+1 comparison, the same helper the
 //! cookie jar uses for `SameSite`): `https://a.example.com` and
@@ -77,18 +91,41 @@
 //! within the staleness window is left alone by both -- this is also the
 //! ordinary, expected shape of two genuinely concurrent writes for the
 //! same hash racing each other, not just the abandoned case.
+//!
+//! `CosOrigins::List`'s `Vec<ImmutableOrigin>` doubles as an LRU list:
+//! order *is* the recency signal (front = least-recently-used, back =
+//! most-recently-used), so no separate timestamps are needed. A
+//! successful read by a listed origin (`touch_listed_origin`, called
+//! from `complete_a_read_request`) moves it to the back. Merging a new
+//! call's candidates in (`merge_origins_list`, called from
+//! `upgrade_resource_visibility`) appends genuinely new ones at the back
+//! and, if that would exceed `net_traits::cross_origin_storage_thread::MAX_ORIGINS_LIST_LENGTH`,
+//! evicts from the front until it fits again -- silently, per that
+//! constant's doc comment, not as an error. An already-present candidate
+//! being re-declared in a merge does *not* move it: only an actual read
+//! refreshes recency, so a writer can't keep a dormant origin artificially
+//! "alive" just by repeatedly re-declaring it without it ever being used.
+//! The touch itself is not separately persisted to disk (seeing this
+//! module's doc comment above on `persist()`'s whole-registry write cost
+//! -- doing so on every single read would mean a disk write per read, not
+//! just per mutation); it piggybacks on whatever the next real mutation's
+//! persist happens to be, so exact recency ordering is only guaranteed
+//! within one running session, falling back to the last-persisted order
+//! across a restart. That is an acceptable soft-fairness degradation, not
+//! a correctness issue: the length cap itself is still always enforced
+//! regardless of persistence timing.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::digest;
 use log::warn;
 use net_traits::cross_origin_storage_thread::{
-    CosHash, CosReadOutcome, CosThreadMsg, RequestedOrigins,
+    CosHash, CosReadOutcome, CosThreadMsg, MAX_ORIGINS_LIST_LENGTH, RequestedOrigins,
 };
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use servo_url::ImmutableOrigin;
 
@@ -175,10 +212,48 @@ fn registry_key(hash: &CosHash) -> String {
     format!("{algorithm}:{value}")
 }
 
+/// Maximum number of read probes a single requesting origin can make in
+/// a burst before `consume_probe_token` starts denying them; see that
+/// method's doc comment for the full reasoning. Sized around large
+/// sharded-AI-model loading (some architectures ship weights as ~25 MiB
+/// shards), where a legitimate page may need to probe hundreds of hashes
+/// in one go: 2000 covers a ~50 GiB model's worth of 25 MiB shards in a
+/// single burst, well past any realistically deployed web model size,
+/// while still being small enough to bound worst-case memory for the
+/// per-origin token map.
+const PROBE_BUDGET_CAPACITY: f64 = 2000.0;
+
+/// Steady-state refill rate for `PROBE_BUDGET_CAPACITY`, in tokens per
+/// second. Fast enough that a legitimate page's staggered probes (one
+/// per shard, as they're needed) never notice the limit even after
+/// exhausting a burst, slow enough that an attacker trying to enumerate
+/// many hashes per second to fingerprint a victim is throttled to a
+/// trickle indefinitely rather than just waiting out one cooldown.
+const PROBE_BUDGET_REFILL_PER_SECOND: f64 = 20.0;
+
+/// One requesting origin's read-probe rate-limit state; see
+/// `consume_probe_token`.
+struct ProbeBudget {
+    /// Current token balance. `f64`, not an integer count, since refill
+    /// accrues continuously (a fraction of a token per elapsed
+    /// millisecond) rather than in discrete per-second ticks -- this
+    /// avoids the token bucket needing its own timer/task, since it can
+    /// just compute elapsed time lazily on each probe instead.
+    tokens: f64,
+    last_refill: Instant,
+}
+
 #[derive(Clone)]
 pub struct CrossOriginStorageStore {
     data: Arc<RwLock<CosRegistryData>>,
     config_dir: Option<PathBuf>,
+    /// Read-probe rate-limit state per requesting origin; see
+    /// `consume_probe_token`. Deliberately not part of `CosRegistryData`:
+    /// this is a rate limiter, not registry content, and resetting it on
+    /// restart (rather than persisting it) is the correct behavior for
+    /// one, not a bug -- an origin should not be penalized across
+    /// browser restarts for probing before a restart.
+    probe_budgets: Arc<Mutex<HashMap<ImmutableOrigin, ProbeBudget>>>,
 }
 
 impl CrossOriginStorageStore {
@@ -213,6 +288,38 @@ impl CrossOriginStorageStore {
         CrossOriginStorageStore {
             data: Arc::new(RwLock::new(data)),
             config_dir,
+            probe_budgets: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// <https://wicg.github.io/cross-origin-storage/#read-requests> notes
+    /// user agents "are expected to implement safeguards against such
+    /// attacks, for example, by limiting the number of probes"; this is
+    /// that safeguard, implemented as a token bucket
+    /// (<https://en.wikipedia.org/wiki/Token_bucket>) per requesting
+    /// origin: `PROBE_BUDGET_CAPACITY` tokens available in a burst,
+    /// refilling at `PROBE_BUDGET_REFILL_PER_SECOND` tokens/second
+    /// thereafter. Returns whether a token was available (the probe may
+    /// proceed) or the origin is over budget (the caller should lie, the
+    /// same way `should_grease` does -- see `complete_a_read_request`).
+    fn consume_probe_token(&self, origin: &ImmutableOrigin) -> bool {
+        let mut budgets = self.probe_budgets.lock();
+        let now = Instant::now();
+        let budget = budgets.entry(origin.clone()).or_insert_with(|| ProbeBudget {
+            tokens: PROBE_BUDGET_CAPACITY,
+            last_refill: now,
+        });
+
+        let elapsed_secs = now.duration_since(budget.last_refill).as_secs_f64();
+        budget.tokens =
+            (budget.tokens + elapsed_secs * PROBE_BUDGET_REFILL_PER_SECOND).min(PROBE_BUDGET_CAPACITY);
+        budget.last_refill = now;
+
+        if budget.tokens >= 1.0 {
+            budget.tokens -= 1.0;
+            true
+        } else {
+            false
         }
     }
 
@@ -267,8 +374,22 @@ impl CrossOriginStorageStore {
 
     /// <https://wicg.github.io/cross-origin-storage/#complete-a-read-request>
     fn complete_a_read_request(&self, hash: &CosHash, origin: &ImmutableOrigin) -> CosReadOutcome {
-        let data = self.data.read();
-        let Some(entry) = data.entries.get(&registry_key(hash)) else {
+        // Every read is a probe (see this module's doc comment); an
+        // origin over its rate limit is lied to exactly like a real miss,
+        // before even looking at the registry, so that a request denied
+        // for being over budget is indistinguishable from one that was
+        // never present or never disclosed.
+        if !self.consume_probe_token(origin) {
+            return CosReadOutcome::NotFound;
+        }
+
+        // A write lock, not a read lock: a successful list-scoped read
+        // mutates the entry's origins list order (`touch_listed_origin`,
+        // see this module's doc comment on the LRU merge policy), so
+        // this needs mutable access even though it's conceptually "just
+        // a read" from the caller's perspective.
+        let mut data = self.data.write();
+        let Some(entry) = data.entries.get_mut(&registry_key(hash)) else {
             return CosReadOutcome::NotFound;
         };
 
@@ -286,6 +407,10 @@ impl CrossOriginStorageStore {
         if !self.apply_availability_gating(entry, hash, origin) {
             return CosReadOutcome::NotFound;
         }
+
+        // Not persisted immediately; see this module's doc comment on
+        // why the LRU touch is a soft, in-memory-first mechanism.
+        touch_listed_origin(entry, origin);
 
         match &entry.bytes {
             Some(bytes) => CosReadOutcome::Found {
@@ -479,17 +604,57 @@ fn upgrade_resource_visibility(entry: &mut CosEntry, requested_origins: Option<R
         },
         RequestedOrigins::List(candidates) => match &mut entry.origins {
             CosOrigins::SameSiteOnly => {
+                // `candidates` is a single call's own list, already
+                // capped at MAX_ORIGINS_LIST_LENGTH by script-side
+                // validation (see that constant's doc comment) before
+                // this message could even be sent, so no merge/eviction
+                // is needed for this (not-yet-list-scoped) case.
                 entry.origins = CosOrigins::List(candidates);
             },
             CosOrigins::List(existing) => {
-                for candidate in candidates {
-                    if !existing.contains(&candidate) {
-                        existing.push(candidate);
-                    }
-                }
+                merge_origins_list(existing, candidates);
             },
             CosOrigins::Wildcard => unreachable!("handled by the early return above"),
         },
+    }
+}
+
+/// Merges `candidates` into `existing`, per
+/// <https://wicg.github.io/cross-origin-storage/#normalize-requested-origins>'s
+/// merge step. `existing`'s order doubles as an LRU recency signal (see
+/// this module's doc comment), so a genuinely new candidate is appended
+/// at the back (most-recently-used end) -- a writer actively requesting
+/// it right now is itself a legitimate "just used" signal -- while an
+/// already-present one is left exactly where it is; re-declaration by a
+/// writer is not the same as an actual read, and only `touch_listed_origin`
+/// (called from the read path) should refresh recency. If the result
+/// would exceed `MAX_ORIGINS_LIST_LENGTH`, the least-recently-used
+/// origins (the front of the list) are evicted, silently, until it fits
+/// again, per: "Merging origins into an existing list-scoped entry would
+/// exceed the implementation-defined maximum length [results in] Success
+/// (excess origins silently dropped)".
+fn merge_origins_list(existing: &mut Vec<ImmutableOrigin>, candidates: Vec<ImmutableOrigin>) {
+    for candidate in candidates {
+        if !existing.contains(&candidate) {
+            existing.push(candidate);
+        }
+    }
+    while existing.len() > MAX_ORIGINS_LIST_LENGTH {
+        existing.remove(0);
+    }
+}
+
+/// Marks `origin` as just-used within a `CosOrigins::List`-scoped
+/// entry's origins list (see this module's doc comment on the LRU merge
+/// policy): moves it to the back (most-recently-used end) if present.
+/// A no-op if `origin` isn't in the list (e.g. disclosure came from
+/// `storing_origins` instead) or `entry` isn't `CosOrigins::List`-scoped.
+fn touch_listed_origin(entry: &mut CosEntry, origin: &ImmutableOrigin) {
+    if let CosOrigins::List(list) = &mut entry.origins {
+        if let Some(position) = list.iter().position(|listed| listed == origin) {
+            let touched = list.remove(position);
+            list.push(touched);
+        }
     }
 }
 
@@ -662,6 +827,165 @@ mod tests {
     }
 
     #[test]
+    fn merge_origins_list_appends_new_candidates_at_the_back() {
+        let a = origin("https://a.example.com");
+        let b = origin("https://b.example.com");
+        let c = origin("https://c.example.com");
+        let mut existing = vec![a.clone(), b.clone()];
+        merge_origins_list(&mut existing, vec![c.clone()]);
+        assert_eq!(existing, vec![a, b, c]);
+    }
+
+    #[test]
+    fn merge_origins_list_does_not_move_an_already_present_candidate() {
+        let a = origin("https://a.example.com");
+        let b = origin("https://b.example.com");
+        let mut existing = vec![a.clone(), b.clone()];
+        // Re-declaring `a` (already present) must not move it: only an
+        // actual read should refresh recency, per this module's doc
+        // comment.
+        merge_origins_list(&mut existing, vec![a.clone()]);
+        assert_eq!(existing, vec![a, b]);
+    }
+
+    #[test]
+    fn merge_origins_list_evicts_the_least_recently_used_when_over_capacity() {
+        let mut existing: Vec<ImmutableOrigin> = (0..MAX_ORIGINS_LIST_LENGTH)
+            .map(|i| origin(&format!("https://origin{i}.example.com")))
+            .collect();
+        let new_origin = origin("https://new-collaborator.example.com");
+        merge_origins_list(&mut existing, vec![new_origin.clone()]);
+
+        assert_eq!(existing.len(), MAX_ORIGINS_LIST_LENGTH);
+        // The origin that was at the front (index 0, least-recently-used)
+        // must be the one evicted to make room.
+        assert!(!existing.contains(&origin("https://origin0.example.com")));
+        // The new one must have been appended at the back.
+        assert_eq!(existing.last(), Some(&new_origin));
+    }
+
+    #[test]
+    fn touch_listed_origin_moves_a_present_origin_to_the_back() {
+        let a = origin("https://a.example.com");
+        let b = origin("https://b.example.com");
+        let c = origin("https://c.example.com");
+        let mut entry = CosEntry {
+            bytes: None,
+            state: CosEntryState::Written,
+            origins: CosOrigins::List(vec![a.clone(), b.clone(), c.clone()]),
+            storing_origins: HashSet::new(),
+            pending_since_unix_secs: 0,
+        };
+        touch_listed_origin(&mut entry, &b);
+        assert!(matches!(
+            &entry.origins,
+            CosOrigins::List(list) if *list == vec![a, c, b]
+        ));
+    }
+
+    #[test]
+    fn touch_listed_origin_is_a_no_op_for_an_absent_origin() {
+        let a = origin("https://a.example.com");
+        let b = origin("https://b.example.com");
+        let absent = origin("https://absent.example.com");
+        let mut entry = CosEntry {
+            bytes: None,
+            state: CosEntryState::Written,
+            origins: CosOrigins::List(vec![a.clone(), b.clone()]),
+            storing_origins: HashSet::new(),
+            pending_since_unix_secs: 0,
+        };
+        touch_listed_origin(&mut entry, &absent);
+        assert!(matches!(
+            &entry.origins,
+            CosOrigins::List(list) if *list == vec![a, b]
+        ));
+    }
+
+    #[test]
+    fn touch_listed_origin_is_a_no_op_for_non_list_scoped_entries() {
+        let mut wildcard_entry = CosEntry {
+            bytes: None,
+            state: CosEntryState::Written,
+            origins: CosOrigins::Wildcard,
+            storing_origins: HashSet::new(),
+            pending_since_unix_secs: 0,
+        };
+        // Must not panic on a non-`List` entry.
+        touch_listed_origin(&mut wildcard_entry, &origin("https://a.example.com"));
+        assert!(matches!(wildcard_entry.origins, CosOrigins::Wildcard));
+    }
+
+    #[test]
+    fn read_touch_updates_lru_order_so_a_recently_read_origin_survives_a_later_merge_eviction() {
+        let store = store();
+        let writer = origin("https://writer.example.com");
+        let listed_origins: Vec<ImmutableOrigin> = (0..MAX_ORIGINS_LIST_LENGTH)
+            .map(|i| origin(&format!("https://origin{i}.example.com")))
+            .collect();
+        let least_recently_used = listed_origins[0].clone();
+        let next_least_recently_used = listed_origins[1].clone();
+        // A real hash of "tiny", not an arbitrary placeholder: the merge
+        // step below goes through the real `verify_and_store`, which
+        // recomputes and checks the digest for real, so the content and
+        // hash must actually match.
+        let content = b"tiny".to_vec();
+        let computed = compute_hex_digest("SHA-256", &content).unwrap();
+        let h = hash("SHA-256", &computed);
+        insert_written_entry_directly(
+            &store,
+            &h,
+            writer,
+            CosOrigins::List(listed_origins),
+            content.clone(),
+        );
+
+        // Reading as the origin currently at the front (least-recently-
+        // used) succeeds, and moves it to the back.
+        assert!(matches!(
+            store.complete_a_read_request(&h, &least_recently_used),
+            CosReadOutcome::Found { .. }
+        ));
+
+        // Merge in one brand-new origin via a second, independent writer
+        // completing a write for the same hash with the same content --
+        // exactly the "unrelated origin writes the same byte-identical
+        // resource" scenario from this module's doc comment. The list is
+        // already at MAX_ORIGINS_LIST_LENGTH, so this must evict exactly
+        // one origin to make room.
+        let new_origin = origin("https://new-collaborator.example.com");
+        let second_writer = origin("https://second-writer.example.com");
+        store
+            .verify_and_store(
+                &h,
+                content,
+                "text/plain".to_owned(),
+                second_writer,
+                Some(RequestedOrigins::List(vec![new_origin.clone()])),
+            )
+            .unwrap();
+
+        // The origin just read from was moved to the back by the read
+        // above, so it must survive the eviction...
+        assert!(matches!(
+            store.complete_a_read_request(&h, &least_recently_used),
+            CosReadOutcome::Found { .. }
+        ));
+        // ...while the origin that was *next* in line (index 1, now at
+        // the front after index 0 moved to the back) is the one evicted
+        // instead.
+        assert!(matches!(
+            store.complete_a_read_request(&h, &next_least_recently_used),
+            CosReadOutcome::NotFound
+        ));
+        // And the newly-merged origin is readable.
+        assert!(matches!(
+            store.complete_a_read_request(&h, &new_origin),
+            CosReadOutcome::Found { .. }
+        ));
+    }
+
+    #[test]
     fn wildcard_entry_is_not_readable_by_an_outside_origin_when_its_hash_is_not_on_the_phl() {
         let store = store();
         let bytes = b"wildcard-scoped".to_vec();
@@ -762,6 +1086,116 @@ mod tests {
     }
 
     #[test]
+    fn consume_probe_token_allows_up_to_capacity_then_denies() {
+        let store = store();
+        let o = origin("https://prober.example");
+        let mut allowed = 0;
+        for _ in 0..(PROBE_BUDGET_CAPACITY as usize) {
+            if store.consume_probe_token(&o) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, PROBE_BUDGET_CAPACITY as usize);
+        // One more, immediately: real elapsed time between the loop above
+        // and this call is a tiny fraction of a second, negligible next
+        // to PROBE_BUDGET_REFILL_PER_SECOND, so no meaningful refill has
+        // happened and this must still be denied.
+        assert!(!store.consume_probe_token(&o));
+    }
+
+    #[test]
+    fn consume_probe_token_tracks_budget_independently_per_origin() {
+        let store = store();
+        let a = origin("https://a.example");
+        let b = origin("https://b.example");
+        for _ in 0..(PROBE_BUDGET_CAPACITY as usize) {
+            assert!(store.consume_probe_token(&a));
+        }
+        assert!(!store.consume_probe_token(&a));
+        // b's budget is untouched by a's exhaustion.
+        assert!(store.consume_probe_token(&b));
+    }
+
+    #[test]
+    fn consume_probe_token_refills_over_time() {
+        let store = store();
+        let o = origin("https://prober.example");
+        for _ in 0..(PROBE_BUDGET_CAPACITY as usize) {
+            assert!(store.consume_probe_token(&o));
+        }
+        assert!(!store.consume_probe_token(&o));
+
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // At PROBE_BUDGET_REFILL_PER_SECOND tokens/sec, 200ms refills
+        // ~4 tokens -- comfortably at least 1, so this must now succeed.
+        assert!(store.consume_probe_token(&o));
+    }
+
+    #[test]
+    fn read_probe_budget_exhaustion_returns_not_found_even_though_entry_exists() {
+        let store = store();
+        let writer = origin("https://writer.example.com");
+        let prober = origin("https://prober.example.com");
+        let h = hash("SHA-256", &"d".repeat(64));
+        // List-scoped so `prober` is explicitly allowed to read it --
+        // isolates this test to budget exhaustion, not availability
+        // gating.
+        insert_written_entry_directly(
+            &store,
+            &h,
+            writer,
+            CosOrigins::List(vec![prober.clone()]),
+            b"tiny".to_vec(),
+        );
+
+        let mut found_count = 0;
+        let mut not_found_count = 0;
+        for _ in 0..(PROBE_BUDGET_CAPACITY as usize + 5) {
+            match store.complete_a_read_request(&h, &prober) {
+                CosReadOutcome::Found { .. } => found_count += 1,
+                CosReadOutcome::NotFound => not_found_count += 1,
+                CosReadOutcome::PendingWrite => panic!("unexpected PendingWrite"),
+            }
+        }
+        assert_eq!(found_count, PROBE_BUDGET_CAPACITY as usize);
+        assert_eq!(not_found_count, 5);
+    }
+
+    #[test]
+    fn probe_budget_is_shared_across_different_hashes_for_the_same_origin() {
+        let store = store();
+        let writer = origin("https://writer.example.com");
+        let prober = origin("https://prober.example.com");
+        let h1 = hash("SHA-256", &"e".repeat(64));
+        let h2 = hash("SHA-256", &"f".repeat(64));
+        insert_written_entry_directly(
+            &store,
+            &h1,
+            writer.clone(),
+            CosOrigins::List(vec![prober.clone()]),
+            b"tiny".to_vec(),
+        );
+        insert_written_entry_directly(
+            &store,
+            &h2,
+            writer,
+            CosOrigins::List(vec![prober.clone()]),
+            b"tiny".to_vec(),
+        );
+
+        // Drain the budget entirely via h1...
+        for _ in 0..(PROBE_BUDGET_CAPACITY as usize) {
+            store.complete_a_read_request(&h1, &prober);
+        }
+        // ...and confirm h2 is now also budget-exhausted for the same
+        // origin, since the budget is per-origin, not per-hash.
+        assert!(matches!(
+            store.complete_a_read_request(&h2, &prober),
+            CosReadOutcome::NotFound
+        ));
+    }
+
+    #[test]
     fn should_grease_never_greases_entries_at_or_above_the_size_cap() {
         let entry = CosEntry {
             bytes: Some(StoredEntryBytes {
@@ -817,7 +1251,16 @@ mod tests {
         );
         insert_written_entry_directly(&store, &h, writer, CosOrigins::Wildcard, b"tiny".to_vec());
 
-        let trials = 3000;
+        // Fewer trials than PROBE_BUDGET_CAPACITY, deliberately: this
+        // test is about GREASE'ing specifically, and every trial here
+        // reuses the same requesting origin's read-probe budget (see
+        // `consume_probe_token`), so a trial count at or above that
+        // budget would start returning NotFound from budget exhaustion
+        // too, confounding what this test is meant to isolate. At p=1%
+        // and 1500 trials, both outcomes are still all but certain
+        // (binomial tail probability of all-same-outcome is effectively
+        // zero).
+        let trials = 1500;
         let mut found = 0;
         let mut not_found = 0;
         for _ in 0..trials {

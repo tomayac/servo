@@ -16,13 +16,19 @@
 //!
 //! Known simplifications, beyond what `registry.rs` and
 //! `filesystemfilehandle.rs` already document:
-//! - `maximum origins list length` (spec 5.1) is not enforced on the
-//!   `origins` option here either (mirrors the same gap in
-//!   `upgrade_resource_visibility`).
 //! - A malformed candidate in `options.origins` rejects the whole request
 //!   with a `TypeError`, per spec step 3; this part is implemented for
 //!   real, not simplified.
+//! - `options.origins`'s own `maximum origins list length` is enforced
+//!   here (see `RequestFileHandle`'s length check right after calling
+//!   `validate_and_normalize_requested_origins`) with a `TypeError`
+//!   before any write is attempted, per
+//!   <https://wicg.github.io/cross-origin-storage/#normalize-requested-origins>.
+//!   See `net_traits::cross_origin_storage_thread::MAX_ORIGINS_LIST_LENGTH`'s
+//!   doc comment for the shared constant and the *merge*-time counterpart
+//!   of this same limit in `net::cross_origin_storage_thread::upgrade_resource_visibility`.
 
+use std::ffi::CString;
 use std::rc::Rc;
 
 use dom_struct::dom_struct;
@@ -42,7 +48,7 @@ use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::crossoriginstorage::filesystemfilehandle::FileSystemFileHandle;
 use crate::dom::crossoriginstorage::hash::CosHash;
-use crate::dom::crossoriginstorage::registry::{self, RequestedOrigins};
+use crate::dom::crossoriginstorage::registry::{self, MAX_ORIGINS_LIST_LENGTH, RequestedOrigins};
 use crate::dom::globalscope::GlobalScope;
 use crate::dom::promise::Promise;
 
@@ -79,8 +85,9 @@ impl CrossOriginStorageManager {
 ///
 /// Returns `Err(())` for a malformed candidate (caller should reject with
 /// `TypeError`); `Ok(None)` if `origins` was not supplied at all;
-/// `Ok(Some(...))` otherwise. `maximum origins list length` is not
-/// enforced; see this module's doc comment.
+/// `Ok(Some(...))` otherwise. `maximum origins list length` is checked
+/// by the caller instead, right after this returns; see
+/// `RequestFileHandle`'s doc comment.
 fn validate_and_normalize_requested_origins(
     origins: &Option<StringOrStringSequence>,
 ) -> Result<Option<RequestedOrigins>, ()> {
@@ -149,6 +156,27 @@ impl CrossOriginStorageManagerMethods<crate::DomTypeHolder> for CrossOriginStora
                 return promise;
             },
         };
+
+        // <https://wicg.github.io/cross-origin-storage/#normalize-requested-origins>:
+        // "If origins is a list longer than [the implementation-defined
+        // maximum length], the user agent must throw a TypeError before
+        // attempting any write." This is a single call's own list, not
+        // the (separately handled, silently-truncated) merge case; see
+        // `MAX_ORIGINS_LIST_LENGTH`'s doc comment.
+        if let Some(RequestedOrigins::List(list)) = &requested_origins {
+            if list.len() > MAX_ORIGINS_LIST_LENGTH {
+                promise.reject_error(
+                    realm,
+                    Error::Type(
+                        CString::new(format!(
+                            "options.origins exceeds the maximum length of {MAX_ORIGINS_LIST_LENGTH}"
+                        ))
+                        .unwrap(),
+                    ),
+                );
+                return promise;
+            }
+        }
 
         let origin = self.global().origin().immutable().clone();
         let name = USVString::from(cos_hash.value.clone());
