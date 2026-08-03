@@ -29,6 +29,7 @@ use crate::dom::bindings::codegen::Bindings::WritableStreamDefaultControllerBind
 use crate::dom::bindings::codegen::UnionTypes::ArrayBufferViewOrArrayBuffer;
 use crate::dom::bindings::conversions::root_from_handlevalue;
 use crate::dom::bindings::error::{Error, ErrorToJsval, Fallible};
+use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::reflector::DomGlobal;
 use crate::dom::bindings::root::{Dom, DomRoot, MutNullableDom};
 use crate::dom::bindings::str::USVString;
@@ -379,21 +380,70 @@ pub struct WritableStreamDefaultController {
     abort_controller: Dom<AbortController>,
 }
 
+/// Hard ceiling on a single Cross-Origin Storage write buffer's size, in
+/// bytes: enforced by `write_chunk_at_position` and `apply_write_params`'s
+/// `"truncate"` command before ever calling `Vec::resize`. Without this, a
+/// page could call `truncate(hugeNumber)` (or `seek(hugeNumber)` followed
+/// by any `write()`) and have this sink attempt to allocate and
+/// zero-fill an arbitrarily large buffer immediately -- an out-of-memory
+/// denial of service reachable from a single script call, well before
+/// `close()`'s registry-side storage-budget check
+/// (`net::cross_origin_storage_thread::verify_and_store`) ever gets a
+/// chance to reject anything. Not spec-mandated (the File System
+/// Standard has no numeric ceiling here either): chosen well above any
+/// real individual file this feature's own budget constants are sized
+/// around (see `net::cross_origin_storage_thread`'s
+/// `PROBE_BUDGET_CAPACITY` doc comment: ~25 MiB sharded-AI-model chunks),
+/// while still bounding how much memory a single allocation attempt can
+/// ever demand.
+const MAX_COS_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
+
+/// Rejects `promise` with a `QuotaExceededError` and returns `true` if
+/// `target` (a prospective new size for a `CrossOriginStorageWrite`
+/// sink's buffer) exceeds `MAX_COS_WRITE_BUFFER_BYTES`, without ever
+/// calling `Vec::resize`; see that constant's doc comment. Callers must
+/// check this *before* resizing, not after.
+fn reject_if_write_target_too_large(cx: &mut JSContext, promise: &Rc<Promise>, target: usize) -> bool {
+    if target > MAX_COS_WRITE_BUFFER_BYTES {
+        promise.reject_error(
+            cx,
+            Error::QuotaExceeded {
+                quota: Some(Finite::wrap(MAX_COS_WRITE_BUFFER_BYTES as f64)),
+                requested: Some(Finite::wrap(target as f64)),
+            },
+        );
+        return true;
+    }
+    false
+}
+
 /// Writes `chunk_bytes` into `bytes` at `position`'s current value,
 /// zero-padding first if that lands past the current end (matching a real
 /// file's semantics), then advances `position` by `chunk_bytes.len()`.
 /// Shared by every chunk type (`ArrayBuffer`/`ArrayBufferView`, `Blob`,
 /// `USVString`) `CrossOriginStorageWrite`'s write algorithm accepts.
-fn write_chunk_at_position(bytes: &RefCell<Vec<u8>>, position: &Cell<usize>, chunk_bytes: &[u8]) {
-    let mut buf = bytes.borrow_mut();
+/// Rejects `promise` and returns `false` without writing anything if the
+/// resulting buffer size would exceed `MAX_COS_WRITE_BUFFER_BYTES`.
+fn write_chunk_at_position(
+    cx: &mut JSContext,
+    promise: &Rc<Promise>,
+    bytes: &RefCell<Vec<u8>>,
+    position: &Cell<usize>,
+    chunk_bytes: &[u8],
+) -> bool {
     let start = position.get();
     let end = start + chunk_bytes.len();
+    if reject_if_write_target_too_large(cx, promise, end) {
+        return false;
+    }
+    let mut buf = bytes.borrow_mut();
     if end > buf.len() {
         buf.resize(end, 0);
     }
     buf[start..end].copy_from_slice(chunk_bytes);
     drop(buf);
     position.set(end);
+    true
 }
 
 /// Parses `value` as `ArrayBuffer`/`ArrayBufferView`, `Blob`, or
@@ -414,14 +464,16 @@ fn write_plain_data_chunk(
         Ok(ConversionResult::Success(buffer_source)) => {
             let chunk_bytes =
                 get_buffer_source_copy(ArrayBufferViewOrArrayBufferRef::from(&buffer_source));
-            write_chunk_at_position(bytes, position, &chunk_bytes);
-            promise.resolve_native(cx, &());
+            if write_chunk_at_position(cx, promise, bytes, position, &chunk_bytes) {
+                promise.resolve_native(cx, &());
+            }
         },
         Ok(ConversionResult::Failure(_)) => match root_from_handlevalue::<Blob>(cx, value) {
             Ok(blob) => match blob.get_bytes() {
                 Ok(blob_bytes) => {
-                    write_chunk_at_position(bytes, position, &blob_bytes);
-                    promise.resolve_native(cx, &());
+                    if write_chunk_at_position(cx, promise, bytes, position, &blob_bytes) {
+                        promise.resolve_native(cx, &());
+                    }
                 },
                 Err(()) => {
                     promise.reject_error(
@@ -432,8 +484,9 @@ fn write_plain_data_chunk(
             },
             Err(()) => match USVString::safe_from_jsval(cx, value, ()) {
                 Ok(ConversionResult::Success(USVString(text))) => {
-                    write_chunk_at_position(bytes, position, text.as_bytes());
-                    promise.resolve_native(cx, &());
+                    if write_chunk_at_position(cx, promise, bytes, position, text.as_bytes()) {
+                        promise.resolve_native(cx, &());
+                    }
                 },
                 Ok(ConversionResult::Failure(_)) => {
                     promise.reject_error(
@@ -462,11 +515,15 @@ fn write_plain_data_chunk(
 ///   effect as `FileSystemWritableFileStream.seek()`).
 /// - `"truncate"`: `size` is required; resizes `bytes`, clamping
 ///   `[[position]]` down if it now exceeds the new size (same effect as
-///   `FileSystemWritableFileStream.truncate()`).
+///   `FileSystemWritableFileStream.truncate()`); rejected with
+///   `QuotaExceededError` instead if `size` exceeds
+///   `MAX_COS_WRITE_BUFFER_BYTES`, without ever resizing anything -- see
+///   that constant's doc comment.
 /// - `"write"`: `data` is required (`ArrayBuffer`/`ArrayBufferView`/
 ///   `Blob`/`USVString`); if `position` is also given, seeks there first
 ///   (a one-shot positioned write), then writes `data` at `[[position]]`
-///   and advances it, same as a bare chunk would.
+///   and advances it, same as a bare chunk would (also subject to
+///   `MAX_COS_WRITE_BUFFER_BYTES`, via `write_chunk_at_position`).
 fn apply_write_params(
     cx: &mut JSContext,
     promise: &Rc<Promise>,
@@ -490,6 +547,9 @@ fn apply_write_params(
         WriteCommandType::Truncate => match params.size {
             Some(Some(size)) => {
                 let size = size as usize;
+                if reject_if_write_target_too_large(cx, promise, size) {
+                    return;
+                }
                 bytes.borrow_mut().resize(size, 0);
                 if position.get() > size {
                     position.set(size);
@@ -944,15 +1004,17 @@ impl WritableStreamDefaultController {
                         let chunk_bytes = get_buffer_source_copy(
                             ArrayBufferViewOrArrayBufferRef::from(&buffer_source),
                         );
-                        write_chunk_at_position(bytes, position, &chunk_bytes);
-                        promise.resolve_native(cx, &());
+                        if write_chunk_at_position(cx, &promise, bytes, position, &chunk_bytes) {
+                            promise.resolve_native(cx, &());
+                        }
                     },
                     Ok(ConversionResult::Failure(_)) => match root_from_handlevalue::<Blob>(cx, chunk)
                     {
                         Ok(blob) => match blob.get_bytes() {
                             Ok(blob_bytes) => {
-                                write_chunk_at_position(bytes, position, &blob_bytes);
-                                promise.resolve_native(cx, &());
+                                if write_chunk_at_position(cx, &promise, bytes, position, &blob_bytes) {
+                                    promise.resolve_native(cx, &());
+                                }
                             },
                             Err(()) => {
                                 promise.reject_error(
