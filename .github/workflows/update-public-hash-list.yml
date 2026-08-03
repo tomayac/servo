@@ -17,8 +17,8 @@ permissions:
 
 jobs:
   update:
-    # This job is only useful when run on this branch's home fork.
-    if: github.repository == 'tomayac/servo' || github.event_name == 'workflow_dispatch'
+    # This job is only useful when run on upstream servo.
+    if: github.repository == 'servo/servo' || github.event_name == 'workflow_dispatch'
     name: Refresh the bundled Public Hash List snapshot
     runs-on: ubuntu-22.04
     steps:
