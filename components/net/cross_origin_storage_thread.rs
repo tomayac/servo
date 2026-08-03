@@ -65,10 +65,10 @@
 //! `verify_and_store` also enforces a storage budget, not spec-mandated
 //! (the explainer only mentions LRU-based eviction under storage
 //! pressure as one *possible* approach, with no numeric guidance): a
-//! dynamic global cap (`storage_budget`, 80% of free disk space plus
-//! whatever Cross-Origin Storage already occupies -- see
-//! `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment for why "already
-//! occupies" has to be added back in) and a per-origin share of that cap
+//! global cap (`storage_budget`, a stable fraction of **total** disk
+//! capacity -- see `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment for
+//! why total capacity rather than available free space, matching real
+//! browser precedent) and a per-origin share of that cap
 //! (`per_origin_share`, `PER_ORIGIN_STORAGE_SHARE_FRACTION`). The two
 //! exist for different reasons: the global cap bounds how much disk
 //! Cross-Origin Storage can ever consume; the per-origin share exists so
@@ -83,6 +83,12 @@
 //! multi-tenant demand, not one origin crowding out another. A write that
 //! still doesn't fit even after every eviction it's entitled to rejects
 //! with `QuotaExceededError` rather than exceeding the budget.
+//!
+//! Separately, `verify_and_store` also checks real, currently *available*
+//! disk space as an internal-only safety net (never reported -- see
+//! `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment), since the total-
+//! disk-based nominal budget above can nominally "allow" a write that
+//! genuinely would not fit right now.
 //!
 //! `SameSiteOnly` disclosure uses `net_traits::pub_domains::is_same_site`
 //! (Public Suffix List-backed eTLD+1 comparison, the same helper the
@@ -362,14 +368,21 @@ pub struct CrossOriginStorageStore {
     /// `consume_write_token`. Same not-persisted reasoning as
     /// `probe_budgets` above.
     write_budgets: Arc<Mutex<HashMap<ImmutableOrigin, TokenBucket>>>,
-    /// Test-only override for `query_free_disk_space`: lets storage-
-    /// budget tests exercise real eviction/rejection behavior through
-    /// the actual `verify_and_store` path with a small, controlled
-    /// budget, instead of the real free disk space (which, for any
-    /// realistic test payload, is effectively unlimited and would never
-    /// naturally trigger eviction). `None` in production.
+    /// Test-only override for `query_free_disk_space` (the internal,
+    /// never-reported safety-net check -- see
+    /// `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment). `None` in
+    /// production.
     #[cfg(test)]
     fake_free_disk_space: Option<u64>,
+    /// Test-only override for `query_total_disk_space` (the basis for
+    /// the *nominal* storage budget): lets storage-budget tests exercise
+    /// real eviction/rejection behavior through the actual
+    /// `verify_and_store` path with a small, controlled budget, instead
+    /// of the real disk's total capacity (which, for any realistic test
+    /// payload, is effectively unlimited and would never naturally
+    /// trigger eviction). `None` in production.
+    #[cfg(test)]
+    fake_total_disk_space: Option<u64>,
 }
 
 impl CrossOriginStorageStore {
@@ -408,6 +421,8 @@ impl CrossOriginStorageStore {
             write_budgets: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             fake_free_disk_space: None,
+            #[cfg(test)]
+            fake_total_disk_space: None,
         }
     }
 
@@ -452,12 +467,15 @@ impl CrossOriginStorageStore {
         )
     }
 
-    /// Free space on the filesystem backing `config_dir`, for
-    /// `storage_budget`. `config_dir: None` (no real persistence at all;
-    /// see `new()`'s doc comment -- only in tests) is treated as
-    /// effectively unbounded rather than querying a nonsensical path, so
-    /// storage budgeting never spuriously kicks in for tests that don't
-    /// care about it.
+    /// Real, currently-available free space on the filesystem backing
+    /// `config_dir` -- used only as `verify_and_store`'s internal,
+    /// never-reported safety net; see `GLOBAL_STORAGE_BUDGET_FRACTION`'s
+    /// doc comment for why the *nominal* budget uses
+    /// `query_total_disk_space` instead. `config_dir: None` (no real
+    /// persistence at all; see `new()`'s doc comment -- only in tests)
+    /// is treated as effectively unbounded rather than querying a
+    /// nonsensical path, so this safety net never spuriously kicks in
+    /// for tests that don't care about it.
     fn query_free_disk_space(&self) -> u64 {
         #[cfg(test)]
         if let Some(fake) = self.fake_free_disk_space {
@@ -474,6 +492,27 @@ impl CrossOriginStorageStore {
     #[cfg(test)]
     fn set_fake_free_disk_space(&mut self, bytes: u64) {
         self.fake_free_disk_space = Some(bytes);
+    }
+
+    /// Total capacity of the filesystem backing `config_dir`, for
+    /// `storage_budget`. `config_dir: None` is treated the same
+    /// unbounded way as `query_free_disk_space`, for the same reason.
+    fn query_total_disk_space(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_total_disk_space {
+            return fake;
+        }
+        let Some(dir) = &self.config_dir else {
+            return u64::MAX / 2;
+        };
+        total_disk_space_at(dir)
+    }
+
+    /// Test-only: overrides `query_total_disk_space`'s result; see
+    /// `fake_total_disk_space`'s doc comment.
+    #[cfg(test)]
+    fn set_fake_total_disk_space(&mut self, bytes: u64) {
+        self.fake_total_disk_space = Some(bytes);
     }
 
     /// Persists registry *metadata* (state, origins, storing-origins) --
@@ -697,9 +736,7 @@ impl CrossOriginStorageStore {
             .get(&key)
             .is_some_and(|entry| entry.storing_origins.contains(&origin));
 
-        let free_disk_space = self.query_free_disk_space();
-        let used = total_bytes_used(&data);
-        let budget = storage_budget(free_disk_space, used);
+        let budget = storage_budget(self.query_total_disk_space());
 
         // A hash's content can never change (it is, definitionally, the
         // hash of that content), so an origin re-verifying a hash it
@@ -739,6 +776,33 @@ impl CrossOriginStorageStore {
             evict_globally_lru(&mut data, self.config_dir.as_deref(), needed);
             if total_bytes_used(&data) + new_bytes_len > budget {
                 // Same reasoning as the per-origin-share rejection above.
+                self.persist(&data);
+                return VerifyAndStoreOutcome::QuotaExceeded {
+                    quota_bytes: budget,
+                    requested_bytes: new_bytes_len,
+                };
+            }
+        }
+
+        // Internal-only safety net: the nominal budget above is a stable
+        // fraction of *total* disk capacity (see
+        // `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment for why), so it
+        // can still nominally "allow" a write that would not actually
+        // fit in real, currently available space -- COS must not attempt
+        // that regardless of what the nominal budget says. Reused
+        // `evict_globally_lru` first, same as the nominal-budget check
+        // above, since a genuinely low-disk condition is exactly the
+        // kind of storage pressure that check is meant for. Critically,
+        // the reported `quota_bytes` on rejection is still the stable
+        // nominal `budget`, never the real free-space figure: a
+        // rejection caused by genuinely low disk space must stay
+        // indistinguishable from an ordinary nominal-budget rejection,
+        // or this safety net itself would become the fingerprinting
+        // vector the nominal budget's design was trying to avoid.
+        if new_bytes_len > self.query_free_disk_space() {
+            let needed = new_bytes_len - self.query_free_disk_space();
+            evict_globally_lru(&mut data, self.config_dir.as_deref(), needed);
+            if new_bytes_len > self.query_free_disk_space() {
                 self.persist(&data);
                 return VerifyAndStoreOutcome::QuotaExceeded {
                     quota_bytes: budget,
@@ -853,12 +917,34 @@ fn should_grease(entry: &CosEntry) -> bool {
 /// `storage_budget`. Not spec-mandated -- the explainer only says user
 /// agents "could delete files automatically based on, for example, a
 /// least recently used approach" under storage pressure, with no numeric
-/// guidance. 80% (rather than a fixed byte count) is dynamic on purpose:
-/// COS's own use case includes multi-gigabyte AI model weights, so a
-/// small fixed cap would defeat the feature, while a percentage of
-/// actual available space scales with the machine it's running on and
-/// still leaves headroom for everything else on disk.
-const GLOBAL_STORAGE_BUDGET_FRACTION: f64 = 0.8;
+/// guidance -- so, like `servo-storage`'s own `STORAGE_SHELF_QUOTA_BYTES`
+/// (`components/storage/client_storage.rs`, matching Firefox's
+/// documented 10 GiB group limit), this follows real browser precedent
+/// rather than inventing a number: per
+/// <https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria>,
+/// Chromium-based browsers allow an origin up to 60% of **total** disk
+/// size, and Safari/WebKit uses a comparable ~60% figure for browser
+/// apps (Firefox is more conservative: 10%, capped at a fixed 10 GiB
+/// group limit). This follows Chrome/Safari's more generous figure
+/// rather than Firefox's, since COS explicitly targets much larger
+/// content (multi-gigabyte AI model weights) than typical Storage API
+/// usage.
+///
+/// Deliberately based on **total** disk capacity, not *available* free
+/// space, matching all three of those engines: as the same MDN page
+/// puts it, "it might not actually be possible for the origin to reach
+/// its quota because it is calculated based on the hard drive total
+/// size, not the currently available disk space. This is done for
+/// security reasons, to avoid fingerprinting." Total capacity is stable
+/// (it doesn't change as other things fill up the disk), so exposing it
+/// in a `QuotaExceededError` (see `VerifyAndStoreOutcome::QuotaExceeded`)
+/// doesn't let a page infer real-time free space the way a live
+/// free-space-derived number would. Real available space still matters
+/// -- COS should not attempt to write past what the OS can actually
+/// provide -- but that check is a silent, internal-only safety net (see
+/// `query_free_disk_space`'s use in `verify_and_store`) that never
+/// surfaces its own number to script, for the same reason.
+const GLOBAL_STORAGE_BUDGET_FRACTION: f64 = 0.6;
 
 /// Fraction of the *current* global budget (see `storage_budget`) any
 /// single requesting origin's own storing-origin usage may occupy; see
@@ -902,19 +988,14 @@ fn origin_storage_usage(data: &CosRegistryData, origin: &ImmutableOrigin) -> u64
         .sum()
 }
 
-/// The current global storage budget in bytes; see
-/// `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment for the formula and
-/// why `used_by_cos` is added back in rather than using raw
-/// `free_disk_space` alone: without adding it back, Cross-Origin
-/// Storage's own growth would shrink its own future budget (every byte
-/// it writes reduces free space, which would shrink the computed cap,
-/// triggering more eviction, in a self-cannibalizing feedback loop). By
-/// adding back what it already occupies, the budget instead reflects
-/// "80% of everything COS could grow into if it consumed all current
-/// headroom," and only shrinks in response to *other* things filling up
-/// the disk, which is when eviction should actually trigger.
-fn storage_budget(free_disk_space: u64, used_by_cos: u64) -> u64 {
-    ((free_disk_space as f64 + used_by_cos as f64) * GLOBAL_STORAGE_BUDGET_FRACTION) as u64
+/// The current global storage budget in bytes: a stable fraction of
+/// **total** disk capacity; see `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc
+/// comment for why total capacity, not available free space, is the
+/// right basis (matching real browser precedent, and avoiding both a
+/// fingerprinting vector and a self-cannibalizing feedback loop where
+/// COS's own growth would otherwise shrink its own future budget).
+fn storage_budget(total_disk_space: u64) -> u64 {
+    (total_disk_space as f64 * GLOBAL_STORAGE_BUDGET_FRACTION) as u64
 }
 
 /// `origin`'s share of `budget`; see `PER_ORIGIN_STORAGE_SHARE_FRACTION`.
@@ -1015,19 +1096,39 @@ fn delete_entry_bytes_file(config_dir: Option<&Path>, key: &str) {
     }
 }
 
-/// The available space (in bytes) on whichever mounted filesystem
-/// contains `path`, per `sysinfo`. Picks the disk whose mount point is
-/// the longest matching prefix of `path`, so a nested mount (e.g. a
-/// separate partition mounted under the config directory's ancestry) is
-/// preferred over a shorter, less specific match.
-fn free_disk_space_at(path: &Path) -> u64 {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
+/// The disk (per `sysinfo`) whose mount point is the longest matching
+/// prefix of `path`, so a nested mount (e.g. a separate partition
+/// mounted under the config directory's ancestry) is preferred over a
+/// shorter, less specific match. Shared by `free_disk_space_at` and
+/// `total_disk_space_at`.
+fn disk_containing<'disks>(disks: &'disks sysinfo::Disks, path: &Path) -> Option<&'disks sysinfo::Disk> {
     disks
         .list()
         .iter()
         .filter(|disk| path.starts_with(disk.mount_point()))
         .max_by_key(|disk| disk.mount_point().as_os_str().len())
+}
+
+/// The available (free) space, in bytes, on whichever mounted
+/// filesystem contains `path`. Used only as `verify_and_store`'s
+/// internal, never-reported safety net (see
+/// `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment for why the *nominal*
+/// budget is based on `total_disk_space_at` instead).
+fn free_disk_space_at(path: &Path) -> u64 {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disk_containing(&disks, path)
         .map(|disk| disk.available_space())
+        .unwrap_or(0)
+}
+
+/// The total capacity, in bytes, of whichever mounted filesystem
+/// contains `path`. This, not `free_disk_space_at`, is the basis for
+/// COS's nominal storage budget; see `GLOBAL_STORAGE_BUDGET_FRACTION`'s
+/// doc comment for why.
+fn total_disk_space_at(path: &Path) -> u64 {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disk_containing(&disks, path)
+        .map(|disk| disk.total_space())
         .unwrap_or(0)
 }
 
@@ -2009,10 +2110,9 @@ mod tests {
     }
 
     #[test]
-    fn storage_budget_is_80_percent_of_free_plus_used() {
-        assert_eq!(storage_budget(1000, 0), 800);
-        assert_eq!(storage_budget(0, 1000), 800);
-        assert_eq!(storage_budget(500, 500), 800);
+    fn storage_budget_is_60_percent_of_total_disk_space() {
+        assert_eq!(storage_budget(1000), 600);
+        assert_eq!(storage_budget(0), 0);
     }
 
     #[test]
@@ -2113,7 +2213,7 @@ mod tests {
         // `evict_globally_lru_evicts_oldest_regardless_of_owner` for that
         // other, expected case.
         let mut store = store();
-        store.set_fake_free_disk_space(100_000);
+        store.set_fake_total_disk_space(100_000);
 
         let flooder = origin("https://flooder.example.com");
         let victim = origin("https://victim.example.com");
@@ -2278,9 +2378,9 @@ mod tests {
     #[test]
     fn verify_and_store_rejects_with_quota_exceeded_when_nothing_can_free_enough_room() {
         let mut store = store();
-        // budget = 0.8 * 100 = 80 bytes; the write below is far bigger
+        // budget = 0.6 * 100 = 60 bytes; the write below is far bigger
         // than that, and there is nothing yet to evict to make room.
-        store.set_fake_free_disk_space(100);
+        store.set_fake_total_disk_space(100);
 
         let bytes = vec![0u8; 1000];
         let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
@@ -2294,6 +2394,37 @@ mod tests {
     }
 
     #[test]
+    fn real_low_free_space_still_rejects_but_never_reports_the_real_number() {
+        let mut store = store();
+        // A huge nominal budget (plenty of "total disk")...
+        store.set_fake_total_disk_space(1_000_000_000);
+        // ...but almost no real free space. The internal safety net must
+        // still reject the write; critically, the reported `quota_bytes`
+        // must be the stable *nominal* budget, not the tiny real
+        // free-space figure -- reporting the real number here would
+        // reintroduce exactly the fingerprinting vector
+        // `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment explains why the
+        // nominal budget avoids.
+        store.set_fake_free_disk_space(10);
+
+        let bytes = vec![0u8; 1000];
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+        let o = origin("https://writer.example.com");
+
+        let expected_nominal_budget = storage_budget(1_000_000_000);
+        match store.verify_and_store(&h, bytes, "text/plain".to_owned(), o, None) {
+            VerifyAndStoreOutcome::QuotaExceeded { quota_bytes, .. } => {
+                assert_eq!(
+                    quota_bytes, expected_nominal_budget,
+                    "must report the stable nominal budget, not the real free-space figure"
+                );
+            },
+            other => panic!("expected QuotaExceeded from the real-free-space safety net, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn eviction_during_a_rejected_write_is_still_persisted_to_disk() {
         let dir = std::env::temp_dir().join(format!("servo-cos-registry-test-{}", uuid_like_suffix()));
         let a = origin("https://a.example.com");
@@ -2303,7 +2434,7 @@ mod tests {
 
         {
             let mut store = CrossOriginStorageStore::new(Some(dir.clone()));
-            store.set_fake_free_disk_space(100);
+            store.set_fake_total_disk_space(100);
 
             // First write: small, fits comfortably within a's share.
             assert!(matches!(
