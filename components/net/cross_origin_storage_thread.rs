@@ -18,8 +18,6 @@
 //! live here.
 //!
 //! Explicitly NOT real:
-//! - No `maximum origins list length` or per-origin write quota
-//!   enforcement.
 //! - Persistence is whole-registry-metadata read-on-startup /
 //!   write-on-every-mutation JSON (see below for why entry *bytes* are
 //!   not part of that), not incremental or transactional; two resource
@@ -56,7 +54,33 @@
 //! limit is not itself an observable signal. `complete_a_create_request`
 //! is deliberately NOT budgeted the same way: it has no return value at
 //! all (see its own doc comment), so it carries no directly observable
-//! signal for an origin to probe with today.
+//! signal for an origin to probe with today. `verify_and_store` (the
+//! actual disk-writing step, unlike `complete_a_create_request`) has its
+//! own separate `consume_write_token` rate limit instead -- see
+//! `WRITE_BUDGET_CAPACITY`'s doc comment for why writes get a smaller,
+//! slower budget than reads.
+//!
+//! `verify_and_store` also enforces a storage budget, not spec-mandated
+//! (the explainer only mentions LRU-based eviction under storage
+//! pressure as one *possible* approach, with no numeric guidance): a
+//! dynamic global cap (`storage_budget`, 80% of free disk space plus
+//! whatever Cross-Origin Storage already occupies -- see
+//! `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment for why "already
+//! occupies" has to be added back in) and a per-origin share of that cap
+//! (`per_origin_share`, `PER_ORIGIN_STORAGE_SHARE_FRACTION`). The two
+//! exist for different reasons: the global cap bounds how much disk
+//! Cross-Origin Storage can ever consume; the per-origin share exists so
+//! that a single origin writing a lot can never force eviction of a
+//! *different* origin's data merely by being more recent -- once an
+//! origin is at its own share, further writes only ever evict that same
+//! origin's own sole-owned entries (`evict_sole_owned_entries_for_origin`),
+//! never a shared or other-owned one. Only when several *different*
+//! origins, each within their own share, collectively exceed the global
+//! cap does eviction fall back to plain cross-origin least-recently-used
+//! (`evict_globally_lru`) -- fair there, since it reflects genuine
+//! multi-tenant demand, not one origin crowding out another. A write that
+//! still doesn't fit even after every eviction it's entitled to rejects
+//! with `QuotaExceededError` rather than exceeding the budget.
 //!
 //! `SameSiteOnly` disclosure uses `net_traits::pub_domains::is_same_site`
 //! (Public Suffix List-backed eTLD+1 comparison, the same helper the
@@ -114,6 +138,22 @@
 //! across a restart. That is an acceptable soft-fairness degradation, not
 //! a correctness issue: the length cap itself is still always enforced
 //! regardless of persistence timing.
+//!
+//! `CosEntry::last_read_unix_secs` is a *separate* recency signal from
+//! the origins-list order above: it tracks how recently an *entry*
+//! (rather than an origin within one entry's list) was last read, and
+//! drives storage-budget eviction order (`evict_sole_owned_entries_for_origin`,
+//! `evict_globally_lru`) instead of the origins-list length cap. Unlike
+//! the origins-list touch, this one is a plain wall-clock timestamp
+//! (persisted as part of the same registry JSON, `#[serde(default)]` for
+//! forward compatibility with a registry saved before this field
+//! existed) rather than a reordered `Vec`, since eviction here deletes
+//! real stored bytes -- a more consequential action than reordering a
+//! visibility list -- so it is worth persisting precisely rather than
+//! only "soft, in-memory-first" the way the origins-list touch is; it is
+//! still only updated on a genuine `Found` read, for the same reason as
+//! the origins-list touch (an entry being merely re-verified by a writer
+//! is not the same as being read).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -124,6 +164,7 @@ use aws_lc_rs::digest;
 use log::warn;
 use net_traits::cross_origin_storage_thread::{
     CosHash, CosReadOutcome, CosThreadMsg, MAX_ORIGINS_LIST_LENGTH, RequestedOrigins,
+    VerifyAndStoreOutcome,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
@@ -188,6 +229,17 @@ struct CosEntry {
     /// it became `Pending`). Only consulted while `state` is still
     /// `Pending`; see `is_stale_pending` and this module's doc comment.
     pending_since_unix_secs: u64,
+    /// Seconds since the Unix epoch when this entry was last successfully
+    /// read (a `Found` outcome), or written if never read since. Drives
+    /// storage-budget eviction order (oldest first); see this module's
+    /// doc comment on storage budgeting. `#[serde(default)]` so a
+    /// registry persisted before this field existed still deserializes,
+    /// with old entries defaulting to the oldest possible value (`0`) --
+    /// making them the first ones evicted under the new scheme, which is
+    /// a reasonable default for entries this implementation has no real
+    /// recency information about yet.
+    #[serde(default)]
+    last_read_unix_secs: u64,
 }
 
 /// Whether `entry` is a `Pending` entry old enough to be treated as
@@ -231,9 +283,24 @@ const PROBE_BUDGET_CAPACITY: f64 = 2000.0;
 /// trickle indefinitely rather than just waiting out one cooldown.
 const PROBE_BUDGET_REFILL_PER_SECOND: f64 = 20.0;
 
-/// One requesting origin's read-probe rate-limit state; see
-/// `consume_probe_token`.
-struct ProbeBudget {
+/// Burst capacity and steady-state refill rate for this implementation's
+/// per-origin *write*-probe rate limit (`consume_write_token`), the
+/// same mechanism as the read-probe budget above but applied to
+/// `verify_and_store` instead: an origin flooding `create()`/`close()`
+/// calls churns the registry and disk I/O regardless of whether writes
+/// are ever actually observable the way reads are (see this module's
+/// doc comment). Smaller and slower than the read budget, since a write
+/// is inherently more expensive for a caller to mount than a read (it
+/// has to actually transmit and hash real bytes), and a legitimate cold
+/// cache load still means writing each missing shard only *once*, not
+/// repeatedly.
+const WRITE_BUDGET_CAPACITY: f64 = 200.0;
+const WRITE_BUDGET_REFILL_PER_SECOND: f64 = 2.0;
+
+/// One requesting origin's rate-limit state for either the read-probe or
+/// write-probe budget (each origin gets one bucket per budget kind); see
+/// `consume_token`.
+struct TokenBucket {
     /// Current token balance. `f64`, not an integer count, since refill
     /// accrues continuously (a fraction of a token per elapsed
     /// millisecond) rather than in discrete per-second ticks -- this
@@ -241,6 +308,37 @@ struct ProbeBudget {
     /// just compute elapsed time lazily on each probe instead.
     tokens: f64,
     last_refill: Instant,
+}
+
+/// Consumes one token from `origin`'s bucket in `buckets` (creating it
+/// at full `capacity` if this is the first time `origin` has been seen),
+/// refilling first based on elapsed time at `refill_per_second`. Shared
+/// by `consume_probe_token` and `consume_write_token`, which just supply
+/// different maps/constants; see those methods' doc comments for what
+/// each is for.
+fn consume_token(
+    buckets: &Mutex<HashMap<ImmutableOrigin, TokenBucket>>,
+    origin: &ImmutableOrigin,
+    capacity: f64,
+    refill_per_second: f64,
+) -> bool {
+    let mut buckets = buckets.lock();
+    let now = Instant::now();
+    let bucket = buckets.entry(origin.clone()).or_insert_with(|| TokenBucket {
+        tokens: capacity,
+        last_refill: now,
+    });
+
+    let elapsed_secs = now.duration_since(bucket.last_refill).as_secs_f64();
+    bucket.tokens = (bucket.tokens + elapsed_secs * refill_per_second).min(capacity);
+    bucket.last_refill = now;
+
+    if bucket.tokens >= 1.0 {
+        bucket.tokens -= 1.0;
+        true
+    } else {
+        false
+    }
 }
 
 #[derive(Clone)]
@@ -253,7 +351,19 @@ pub struct CrossOriginStorageStore {
     /// restart (rather than persisting it) is the correct behavior for
     /// one, not a bug -- an origin should not be penalized across
     /// browser restarts for probing before a restart.
-    probe_budgets: Arc<Mutex<HashMap<ImmutableOrigin, ProbeBudget>>>,
+    probe_budgets: Arc<Mutex<HashMap<ImmutableOrigin, TokenBucket>>>,
+    /// Write-probe rate-limit state per requesting origin; see
+    /// `consume_write_token`. Same not-persisted reasoning as
+    /// `probe_budgets` above.
+    write_budgets: Arc<Mutex<HashMap<ImmutableOrigin, TokenBucket>>>,
+    /// Test-only override for `query_free_disk_space`: lets storage-
+    /// budget tests exercise real eviction/rejection behavior through
+    /// the actual `verify_and_store` path with a small, controlled
+    /// budget, instead of the real free disk space (which, for any
+    /// realistic test payload, is effectively unlimited and would never
+    /// naturally trigger eviction). `None` in production.
+    #[cfg(test)]
+    fake_free_disk_space: Option<u64>,
 }
 
 impl CrossOriginStorageStore {
@@ -289,38 +399,70 @@ impl CrossOriginStorageStore {
             data: Arc::new(RwLock::new(data)),
             config_dir,
             probe_budgets: Arc::new(Mutex::new(HashMap::new())),
+            write_budgets: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(test)]
+            fake_free_disk_space: None,
         }
     }
 
     /// <https://wicg.github.io/cross-origin-storage/#read-requests> notes
     /// user agents "are expected to implement safeguards against such
     /// attacks, for example, by limiting the number of probes"; this is
-    /// that safeguard, implemented as a token bucket
-    /// (<https://en.wikipedia.org/wiki/Token_bucket>) per requesting
-    /// origin: `PROBE_BUDGET_CAPACITY` tokens available in a burst,
-    /// refilling at `PROBE_BUDGET_REFILL_PER_SECOND` tokens/second
-    /// thereafter. Returns whether a token was available (the probe may
-    /// proceed) or the origin is over budget (the caller should lie, the
-    /// same way `should_grease` does -- see `complete_a_read_request`).
+    /// that safeguard: `PROBE_BUDGET_CAPACITY` tokens available in a
+    /// burst per requesting origin, refilling at
+    /// `PROBE_BUDGET_REFILL_PER_SECOND` tokens/second thereafter (see
+    /// `consume_token`). Returns whether a token was available (the
+    /// probe may proceed) or the origin is over budget (the caller
+    /// should lie, the same way `should_grease` does -- see
+    /// `complete_a_read_request`).
     fn consume_probe_token(&self, origin: &ImmutableOrigin) -> bool {
-        let mut budgets = self.probe_budgets.lock();
-        let now = Instant::now();
-        let budget = budgets.entry(origin.clone()).or_insert_with(|| ProbeBudget {
-            tokens: PROBE_BUDGET_CAPACITY,
-            last_refill: now,
-        });
+        consume_token(
+            &self.probe_budgets,
+            origin,
+            PROBE_BUDGET_CAPACITY,
+            PROBE_BUDGET_REFILL_PER_SECOND,
+        )
+    }
 
-        let elapsed_secs = now.duration_since(budget.last_refill).as_secs_f64();
-        budget.tokens =
-            (budget.tokens + elapsed_secs * PROBE_BUDGET_REFILL_PER_SECOND).min(PROBE_BUDGET_CAPACITY);
-        budget.last_refill = now;
+    /// The write counterpart of `consume_probe_token`; see
+    /// `WRITE_BUDGET_CAPACITY`'s doc comment for why it has different
+    /// numbers. Returns whether a token was available (the write may
+    /// proceed) or the origin is over budget (`verify_and_store` should
+    /// reject with a real, distinguishable error -- unlike a read, a
+    /// write has no honest way to "lie" about having happened: silently
+    /// pretending success without actually storing the caller's data
+    /// would be a correctness problem, not just a privacy one).
+    fn consume_write_token(&self, origin: &ImmutableOrigin) -> bool {
+        consume_token(
+            &self.write_budgets,
+            origin,
+            WRITE_BUDGET_CAPACITY,
+            WRITE_BUDGET_REFILL_PER_SECOND,
+        )
+    }
 
-        if budget.tokens >= 1.0 {
-            budget.tokens -= 1.0;
-            true
-        } else {
-            false
+    /// Free space on the filesystem backing `config_dir`, for
+    /// `storage_budget`. `config_dir: None` (no real persistence at all;
+    /// see `new()`'s doc comment -- only in tests) is treated as
+    /// effectively unbounded rather than querying a nonsensical path, so
+    /// storage budgeting never spuriously kicks in for tests that don't
+    /// care about it.
+    fn query_free_disk_space(&self) -> u64 {
+        #[cfg(test)]
+        if let Some(fake) = self.fake_free_disk_space {
+            return fake;
         }
+        let Some(dir) = &self.config_dir else {
+            return u64::MAX / 2;
+        };
+        free_disk_space_at(dir)
+    }
+
+    /// Test-only: overrides `query_free_disk_space`'s result; see
+    /// `fake_free_disk_space`'s doc comment.
+    #[cfg(test)]
+    fn set_fake_free_disk_space(&mut self, bytes: u64) {
+        self.fake_free_disk_space = Some(bytes);
     }
 
     /// Persists registry *metadata* (state, origins, storing-origins) --
@@ -365,9 +507,9 @@ impl CrossOriginStorageStore {
                 self.abandon_pending_write(&hash);
             },
             CosThreadMsg::VerifyAndStore(hash, bytes, type_string, origin, requested_origins, response_sender) => {
-                let result =
+                let outcome =
                     self.verify_and_store(&hash, bytes, type_string, origin, requested_origins);
-                let _ = response_sender.send(result);
+                let _ = response_sender.send(outcome);
             },
         }
     }
@@ -409,8 +551,17 @@ impl CrossOriginStorageStore {
         }
 
         // Not persisted immediately; see this module's doc comment on
-        // why the LRU touch is a soft, in-memory-first mechanism.
+        // why both LRU touches below are soft, in-memory-first
+        // mechanisms.
         touch_listed_origin(entry, origin);
+        if entry.bytes.is_some() {
+            // Drives storage-budget eviction order; see this module's
+            // doc comment on storage budgeting. Set before the match
+            // below (rather than inside its `Some` arm) so this mutable
+            // access to `entry` doesn't overlap with `entry.bytes`'s
+            // shared borrow there.
+            entry.last_read_unix_secs = unix_now_secs();
+        }
 
         match &entry.bytes {
             Some(bytes) => CosReadOutcome::Found {
@@ -448,6 +599,7 @@ impl CrossOriginStorageStore {
                 origins: normalized,
                 storing_origins: HashSet::new(),
                 pending_since_unix_secs: unix_now_secs(),
+                last_read_unix_secs: unix_now_secs(),
             });
         }
         self.persist(&data);
@@ -475,22 +627,77 @@ impl CrossOriginStorageStore {
         type_string: String,
         origin: ImmutableOrigin,
         requested_origins: Option<RequestedOrigins>,
-    ) -> Result<(), ()> {
+    ) -> VerifyAndStoreOutcome {
+        if !self.consume_write_token(&origin) {
+            return VerifyAndStoreOutcome::RateLimited;
+        }
+
         let Some(computed_hex) = compute_hex_digest(&hash.algorithm, &bytes) else {
-            return Err(());
+            return VerifyAndStoreOutcome::HashMismatch;
         };
         if computed_hex != hash.value.to_ascii_lowercase() {
-            return Err(());
+            return VerifyAndStoreOutcome::HashMismatch;
         }
 
         let key = registry_key(hash);
-        // Write the (possibly large) bytes to their own file before
-        // taking the registry lock, so the lock is held only for cheap
-        // metadata bookkeeping below, not for however long this disk
-        // write takes.
+        let new_bytes_len = bytes.len() as u64;
+
+        // Held for the whole operation below (quota check, eviction, and
+        // the disk write itself), unlike a plain metadata mutation
+        // elsewhere in this file: an eviction decision has to be made
+        // against the same in-memory state it then acts on, and this
+        // module's doc comment already documents that persistence here
+        // is not safe across multiple concurrent resource threads anyway
+        // (not a realistic configuration for this implementation).
+        let mut data = self.data.write();
+
+        let already_storing = data
+            .entries
+            .get(&key)
+            .is_some_and(|entry| entry.storing_origins.contains(&origin));
+
+        let free_disk_space = self.query_free_disk_space();
+        let used = total_bytes_used(&data);
+        let budget = storage_budget(free_disk_space, used);
+
+        // A hash's content can never change (it is, definitionally, the
+        // hash of that content), so an origin re-verifying a hash it
+        // already stores can never grow its own usage -- only a
+        // genuinely new (to this origin) entry needs a quota check.
+        if !already_storing {
+            let share = per_origin_share(budget);
+            let origin_usage = origin_storage_usage(&data, &origin);
+            if origin_usage + new_bytes_len > share {
+                let needed = origin_usage + new_bytes_len - share;
+                evict_sole_owned_entries_for_origin(
+                    &mut data,
+                    self.config_dir.as_deref(),
+                    &origin,
+                    needed,
+                );
+                if origin_storage_usage(&data, &origin) + new_bytes_len > share {
+                    return VerifyAndStoreOutcome::QuotaExceeded {
+                        quota_bytes: share,
+                        requested_bytes: new_bytes_len,
+                    };
+                }
+            }
+        }
+
+        let used_after_self_eviction = total_bytes_used(&data);
+        if used_after_self_eviction + new_bytes_len > budget {
+            let needed = used_after_self_eviction + new_bytes_len - budget;
+            evict_globally_lru(&mut data, self.config_dir.as_deref(), needed);
+            if total_bytes_used(&data) + new_bytes_len > budget {
+                return VerifyAndStoreOutcome::QuotaExceeded {
+                    quota_bytes: budget,
+                    requested_bytes: new_bytes_len,
+                };
+            }
+        }
+
         self.persist_entry_bytes(&key, &bytes);
 
-        let mut data = self.data.write();
         let entry = data
             .entries
             .entry(key)
@@ -500,15 +707,17 @@ impl CrossOriginStorageStore {
                 origins: CosOrigins::SameSiteOnly,
                 storing_origins: HashSet::new(),
                 pending_since_unix_secs: unix_now_secs(),
+                last_read_unix_secs: unix_now_secs(),
             });
 
         entry.bytes = Some(StoredEntryBytes { bytes, type_string });
         entry.state = CosEntryState::Written;
+        entry.last_read_unix_secs = unix_now_secs();
         entry.storing_origins.insert(origin);
         upgrade_resource_visibility(entry, requested_origins);
         self.persist(&data);
 
-        Ok(())
+        VerifyAndStoreOutcome::Success
     }
 
     /// <https://wicg.github.io/cross-origin-storage/#apply-availability-gating>
@@ -586,6 +795,189 @@ const GREASE_MAX_SIZE_BYTES: usize = 500 * 1024;
 fn should_grease(entry: &CosEntry) -> bool {
     let size = entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len());
     size < GREASE_MAX_SIZE_BYTES && rand::random_bool(GREASE_PROBABILITY)
+}
+
+/// Fraction of (free disk space + bytes already used by Cross-Origin
+/// Storage) this implementation allows itself to occupy; see
+/// `storage_budget`. Not spec-mandated -- the explainer only says user
+/// agents "could delete files automatically based on, for example, a
+/// least recently used approach" under storage pressure, with no numeric
+/// guidance. 80% (rather than a fixed byte count) is dynamic on purpose:
+/// COS's own use case includes multi-gigabyte AI model weights, so a
+/// small fixed cap would defeat the feature, while a percentage of
+/// actual available space scales with the machine it's running on and
+/// still leaves headroom for everything else on disk.
+const GLOBAL_STORAGE_BUDGET_FRACTION: f64 = 0.8;
+
+/// Fraction of the *current* global budget (see `storage_budget`) any
+/// single requesting origin's own storing-origin usage may occupy; see
+/// `origin_storage_usage` and `evict_sole_owned_entries_for_origin`.
+/// Exists so one origin writing a lot cannot force eviction of a
+/// *different* origin's entries merely by writing more recently -- once
+/// an origin is at its own share, further writes evict only that same
+/// origin's own sole-owned entries (see that function's doc comment for
+/// why "sole-owned" specifically), never anyone else's. 20% means up to
+/// five origins can each hold a full share simultaneously before the
+/// *global* budget (not any single origin) becomes the binding
+/// constraint, which then falls back to plain cross-origin LRU (see
+/// `evict_globally_lru`) -- fair in that scenario, since it reflects
+/// genuine multi-tenant demand rather than one origin crowding out
+/// another.
+const PER_ORIGIN_STORAGE_SHARE_FRACTION: f64 = 0.2;
+
+/// Total bytes of every `Written` entry's stored bytes across the whole
+/// registry (entry bytes already live in memory once loaded; see this
+/// module's doc comment on `CrossOriginStorageStore::new`, so this is a
+/// cheap in-memory sum, not a disk scan).
+fn total_bytes_used(data: &CosRegistryData) -> u64 {
+    data.entries
+        .values()
+        .map(|entry| entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len() as u64))
+        .sum()
+}
+
+/// Total bytes of every entry `origin` is a storing origin for. An entry
+/// with multiple storing origins (the same content independently
+/// verified by more than one writer) counts its full size against
+/// *every* one of them, not divided up: this measures how much each
+/// origin has itself chosen to write/verify, not how many physical bytes
+/// are on disk, and dividing it up would let an origin get "free" quota
+/// usage by re-verifying content someone else already stored.
+fn origin_storage_usage(data: &CosRegistryData, origin: &ImmutableOrigin) -> u64 {
+    data.entries
+        .values()
+        .filter(|entry| entry.storing_origins.contains(origin))
+        .map(|entry| entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len() as u64))
+        .sum()
+}
+
+/// The current global storage budget in bytes; see
+/// `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment for the formula and
+/// why `used_by_cos` is added back in rather than using raw
+/// `free_disk_space` alone: without adding it back, Cross-Origin
+/// Storage's own growth would shrink its own future budget (every byte
+/// it writes reduces free space, which would shrink the computed cap,
+/// triggering more eviction, in a self-cannibalizing feedback loop). By
+/// adding back what it already occupies, the budget instead reflects
+/// "80% of everything COS could grow into if it consumed all current
+/// headroom," and only shrinks in response to *other* things filling up
+/// the disk, which is when eviction should actually trigger.
+fn storage_budget(free_disk_space: u64, used_by_cos: u64) -> u64 {
+    ((free_disk_space as f64 + used_by_cos as f64) * GLOBAL_STORAGE_BUDGET_FRACTION) as u64
+}
+
+/// `origin`'s share of `budget`; see `PER_ORIGIN_STORAGE_SHARE_FRACTION`.
+fn per_origin_share(budget: u64) -> u64 {
+    (budget as f64 * PER_ORIGIN_STORAGE_SHARE_FRACTION) as u64
+}
+
+/// Evicts `origin`'s own *sole-owned* `Written` entries (ones where it
+/// is the only storing origin), oldest-last-read-first, until at least
+/// `bytes_needed` are freed or there are no more eligible entries.
+/// Deliberately never touches an entry with more than one storing
+/// origin, even one `origin` is a co-owner of: `origin` writing enough
+/// to hit its own share must never be able to delete a *different*
+/// origin's data as a side effect, and a shared entry is, by
+/// definition, partly someone else's. If this cannot free enough
+/// (because `origin`'s remaining usage is all in shared entries), the
+/// caller rejects the write instead of reaching into shared data.
+fn evict_sole_owned_entries_for_origin(
+    data: &mut CosRegistryData,
+    config_dir: Option<&Path>,
+    origin: &ImmutableOrigin,
+    bytes_needed: u64,
+) {
+    let mut candidates: Vec<(String, u64, u64)> = data
+        .entries
+        .iter()
+        .filter(|(_, entry)| {
+            entry.state == CosEntryState::Written &&
+                entry.storing_origins.len() == 1 &&
+                entry.storing_origins.contains(origin)
+        })
+        .map(|(key, entry)| {
+            let size = entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len() as u64);
+            (key.clone(), size, entry.last_read_unix_secs)
+        })
+        .collect();
+    candidates.sort_by_key(|(_, _, last_read_unix_secs)| *last_read_unix_secs);
+
+    let mut freed = 0u64;
+    for (key, size, _) in candidates {
+        if freed >= bytes_needed {
+            break;
+        }
+        data.entries.remove(&key);
+        delete_entry_bytes_file(config_dir, &key);
+        freed += size;
+    }
+}
+
+/// Evicts `Written` entries regardless of owner, oldest-last-read-first,
+/// until at least `bytes_needed` are freed or there are no more entries.
+/// The fallback for when several *different* origins, each individually
+/// within its own `PER_ORIGIN_STORAGE_SHARE_FRACTION` share, collectively
+/// still exceed the global budget -- ordinary multi-tenant storage
+/// pressure, not one origin's abuse, so plain least-recently-used (as
+/// the explainer itself suggests for storage pressure generally) is a
+/// fair policy here.
+fn evict_globally_lru(data: &mut CosRegistryData, config_dir: Option<&Path>, bytes_needed: u64) {
+    let mut candidates: Vec<(String, u64, u64)> = data
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.state == CosEntryState::Written)
+        .map(|(key, entry)| {
+            let size = entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len() as u64);
+            (key.clone(), size, entry.last_read_unix_secs)
+        })
+        .collect();
+    candidates.sort_by_key(|(_, _, last_read_unix_secs)| *last_read_unix_secs);
+
+    let mut freed = 0u64;
+    for (key, size, _) in candidates {
+        if freed >= bytes_needed {
+            break;
+        }
+        data.entries.remove(&key);
+        delete_entry_bytes_file(config_dir, &key);
+        freed += size;
+    }
+}
+
+/// Deletes an evicted entry's per-entry bytes file, if `config_dir` is
+/// set (see this module's doc comment on why entry bytes live in their
+/// own file). A missing file is not a warning-worthy problem (nothing to
+/// clean up); any other error is, since it means eviction "freed" bytes
+/// that are still actually on disk.
+fn delete_entry_bytes_file(config_dir: Option<&Path>, key: &str) {
+    let Some(dir) = config_dir else {
+        return;
+    };
+    let path = entry_bytes_path(dir, key);
+    if let Err(err) = std::fs::remove_file(&path) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                "Could not delete evicted Cross-Origin Storage entry bytes at {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// The available space (in bytes) on whichever mounted filesystem
+/// contains `path`, per `sysinfo`. Picks the disk whose mount point is
+/// the longest matching prefix of `path`, so a nested mount (e.g. a
+/// separate partition mounted under the config directory's ancestry) is
+/// preferred over a shorter, less specific match.
+fn free_disk_space_at(path: &Path) -> u64 {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .list()
+        .iter()
+        .filter(|disk| path.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(|disk| disk.available_space())
+        .unwrap_or(0)
 }
 
 /// <https://wicg.github.io/cross-origin-storage/#upgrade-resource-visibility>
@@ -696,6 +1088,27 @@ mod tests {
         CrossOriginStorageStore::new(None)
     }
 
+    /// A `Written` entry of `size` bytes, for storage-budget tests that
+    /// only care about size/ownership/recency, not real hash-verified
+    /// content.
+    fn written_entry(
+        size: usize,
+        storing_origins: HashSet<ImmutableOrigin>,
+        last_read_unix_secs: u64,
+    ) -> CosEntry {
+        CosEntry {
+            bytes: Some(StoredEntryBytes {
+                bytes: vec![0u8; size],
+                type_string: String::new(),
+            }),
+            state: CosEntryState::Written,
+            origins: CosOrigins::SameSiteOnly,
+            storing_origins,
+            pending_since_unix_secs: 0,
+            last_read_unix_secs,
+        }
+    }
+
     #[test]
     fn unknown_hash_reads_as_not_found() {
         let store = store();
@@ -715,11 +1128,10 @@ mod tests {
         let h = hash("SHA-256", &computed);
         let writer = origin("https://writer.example");
 
-        assert!(
-            store
-                .verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None)
-                .is_ok()
-        );
+        assert!(matches!(
+            store.verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
 
         match store.complete_a_read_request(&h, &writer) {
             CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
@@ -732,11 +1144,10 @@ mod tests {
         let store = store();
         let h = hash("SHA-256", &"0".repeat(64));
         let writer = origin("https://writer.example");
-        assert!(
-            store
-                .verify_and_store(&h, b"wrong bytes".to_vec(), "text/plain".to_owned(), writer, None)
-                .is_err()
-        );
+        assert!(matches!(
+            store.verify_and_store(&h, b"wrong bytes".to_vec(), "text/plain".to_owned(), writer, None),
+            VerifyAndStoreOutcome::HashMismatch
+        ));
     }
 
     #[test]
@@ -748,9 +1159,10 @@ mod tests {
         let writer = origin("https://writer.example");
         let other = origin("https://other.example");
 
-        store
-            .verify_and_store(&h, bytes, "text/plain".to_owned(), writer, None)
-            .unwrap();
+        assert!(matches!(
+            store.verify_and_store(&h, bytes, "text/plain".to_owned(), writer, None),
+            VerifyAndStoreOutcome::Success
+        ));
 
         assert!(matches!(
             store.complete_a_read_request(&h, &other),
@@ -769,9 +1181,10 @@ mod tests {
         let writer = origin("https://writer.example.com");
         let reader = origin("https://reader.example.com");
 
-        store
-            .verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer, None)
-            .unwrap();
+        assert!(matches!(
+            store.verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer, None),
+            VerifyAndStoreOutcome::Success
+        ));
 
         match store.complete_a_read_request(&h, &reader) {
             CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
@@ -791,9 +1204,10 @@ mod tests {
         let writer = origin("https://example.com");
         let other = origin("https://example.co.uk");
 
-        store
-            .verify_and_store(&h, bytes, "text/plain".to_owned(), writer, None)
-            .unwrap();
+        assert!(matches!(
+            store.verify_and_store(&h, bytes, "text/plain".to_owned(), writer, None),
+            VerifyAndStoreOutcome::Success
+        ));
 
         assert!(matches!(
             store.complete_a_read_request(&h, &other),
@@ -810,15 +1224,16 @@ mod tests {
         let writer = origin("https://writer.example");
         let listed = origin("https://listed.example");
 
-        store
-            .verify_and_store(
+        assert!(matches!(
+            store.verify_and_store(
                 &h,
                 bytes,
                 "text/plain".to_owned(),
                 writer,
                 Some(RequestedOrigins::List(vec![listed.clone()])),
-            )
-            .unwrap();
+            ),
+            VerifyAndStoreOutcome::Success
+        ));
 
         assert!(matches!(
             store.complete_a_read_request(&h, &listed),
@@ -875,6 +1290,7 @@ mod tests {
             origins: CosOrigins::List(vec![a.clone(), b.clone(), c.clone()]),
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            last_read_unix_secs: 0,
         };
         touch_listed_origin(&mut entry, &b);
         assert!(matches!(
@@ -894,6 +1310,7 @@ mod tests {
             origins: CosOrigins::List(vec![a.clone(), b.clone()]),
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            last_read_unix_secs: 0,
         };
         touch_listed_origin(&mut entry, &absent);
         assert!(matches!(
@@ -910,6 +1327,7 @@ mod tests {
             origins: CosOrigins::Wildcard,
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            last_read_unix_secs: 0,
         };
         // Must not panic on a non-`List` entry.
         touch_listed_origin(&mut wildcard_entry, &origin("https://a.example.com"));
@@ -955,15 +1373,16 @@ mod tests {
         // one origin to make room.
         let new_origin = origin("https://new-collaborator.example.com");
         let second_writer = origin("https://second-writer.example.com");
-        store
-            .verify_and_store(
+        assert!(matches!(
+            store.verify_and_store(
                 &h,
                 content,
                 "text/plain".to_owned(),
                 second_writer,
                 Some(RequestedOrigins::List(vec![new_origin.clone()])),
-            )
-            .unwrap();
+            ),
+            VerifyAndStoreOutcome::Success
+        ));
 
         // The origin just read from was moved to the back by the read
         // above, so it must survive the eviction...
@@ -994,15 +1413,16 @@ mod tests {
         let writer = origin("https://writer.example");
         let outsider = origin("https://outsider.example");
 
-        store
-            .verify_and_store(
+        assert!(matches!(
+            store.verify_and_store(
                 &h,
                 bytes,
                 "text/plain".to_owned(),
                 writer,
                 Some(RequestedOrigins::Wildcard),
-            )
-            .unwrap();
+            ),
+            VerifyAndStoreOutcome::Success
+        ));
 
         // Fails closed: this hash (of arbitrary test content) is not on
         // the bundled Public Hash List snapshot, so a "*"-scoped entry
@@ -1037,6 +1457,7 @@ mod tests {
                 origins,
                 storing_origins: HashSet::from([storing_origin]),
                 pending_since_unix_secs: 0,
+                last_read_unix_secs: 0,
             },
         );
     }
@@ -1206,6 +1627,7 @@ mod tests {
             origins: CosOrigins::Wildcard,
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            last_read_unix_secs: 0,
         };
         for _ in 0..500 {
             assert!(!should_grease(&entry));
@@ -1223,6 +1645,7 @@ mod tests {
             origins: CosOrigins::Wildcard,
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            last_read_unix_secs: 0,
         };
         let trials = 3000;
         let greased_count = (0..trials).filter(|_| should_grease(&entry)).count();
@@ -1358,26 +1781,28 @@ mod tests {
         let h = hash("SHA-256", &computed);
         let writer = origin("https://writer.example");
 
-        store
-            .verify_and_store(
+        assert!(matches!(
+            store.verify_and_store(
                 &h,
                 bytes.clone(),
                 "text/plain".to_owned(),
                 writer.clone(),
                 Some(RequestedOrigins::Wildcard),
-            )
-            .unwrap();
+            ),
+            VerifyAndStoreOutcome::Success
+        ));
 
         let second_writer = origin("https://second-writer.example");
-        store
-            .verify_and_store(
+        assert!(matches!(
+            store.verify_and_store(
                 &h,
                 bytes,
                 "text/plain".to_owned(),
                 second_writer,
                 Some(RequestedOrigins::List(vec![origin("https://narrow.example")])),
-            )
-            .unwrap();
+            ),
+            VerifyAndStoreOutcome::Success
+        ));
 
         let data = store.data.read();
         let entry = data.entries.get(&registry_key(&h)).unwrap();
@@ -1432,9 +1857,10 @@ mod tests {
         let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
         let h = hash("SHA-256", &computed);
         store.complete_a_create_request(&h, None);
-        store
-            .verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None)
-            .unwrap();
+        assert!(matches!(
+            store.verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
 
         match store.complete_a_read_request(&h, &writer) {
             CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
@@ -1472,9 +1898,10 @@ mod tests {
         let h = hash("SHA-256", &computed);
         let writer = origin("https://writer.example");
 
-        store
-            .verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None)
-            .unwrap();
+        assert!(matches!(
+            store.verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
         store.abandon_pending_write(&h);
 
         match store.complete_a_read_request(&h, &writer) {
@@ -1509,9 +1936,10 @@ mod tests {
 
         {
             let store = CrossOriginStorageStore::new(Some(dir.clone()));
-            store
-                .verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None)
-                .unwrap();
+            assert!(matches!(
+                store.verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), writer.clone(), None),
+                VerifyAndStoreOutcome::Success
+            ));
         }
 
         // A fresh store pointed at the same config_dir should load what
@@ -1524,6 +1952,219 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_budget_is_80_percent_of_free_plus_used() {
+        assert_eq!(storage_budget(1000, 0), 800);
+        assert_eq!(storage_budget(0, 1000), 800);
+        assert_eq!(storage_budget(500, 500), 800);
+    }
+
+    #[test]
+    fn per_origin_share_is_20_percent_of_the_budget() {
+        assert_eq!(per_origin_share(1000), 200);
+    }
+
+    #[test]
+    fn total_bytes_used_sums_every_written_entrys_bytes() {
+        let mut data = CosRegistryData::default();
+        data.entries.insert("a".to_owned(), written_entry(10, HashSet::new(), 0));
+        data.entries.insert("b".to_owned(), written_entry(25, HashSet::new(), 0));
+        assert_eq!(total_bytes_used(&data), 35);
+    }
+
+    #[test]
+    fn origin_storage_usage_only_counts_entries_the_origin_stores() {
+        let a = origin("https://a.example.com");
+        let b = origin("https://b.example.com");
+        let mut data = CosRegistryData::default();
+        data.entries
+            .insert("owned-by-a".to_owned(), written_entry(10, HashSet::from([a.clone()]), 0));
+        data.entries
+            .insert("owned-by-b".to_owned(), written_entry(20, HashSet::from([b.clone()]), 0));
+        data.entries.insert(
+            "shared".to_owned(),
+            written_entry(5, HashSet::from([a.clone(), b.clone()]), 0),
+        );
+        assert_eq!(origin_storage_usage(&data, &a), 15); // 10 + 5
+        assert_eq!(origin_storage_usage(&data, &b), 25); // 20 + 5
+    }
+
+    #[test]
+    fn evict_sole_owned_entries_for_origin_never_touches_a_shared_entry() {
+        let a = origin("https://a.example.com");
+        let b = origin("https://b.example.com");
+        let mut data = CosRegistryData::default();
+        data.entries
+            .insert("sole-owned".to_owned(), written_entry(10, HashSet::from([a.clone()]), 100));
+        data.entries.insert(
+            "shared".to_owned(),
+            written_entry(50, HashSet::from([a.clone(), b.clone()]), 50),
+        );
+
+        // Ask for more than the sole-owned entry alone can free -- if
+        // shared entries were eligible, evicting "shared" too would
+        // easily cover it.
+        evict_sole_owned_entries_for_origin(&mut data, None, &a, 30);
+
+        assert!(!data.entries.contains_key("sole-owned"));
+        // "shared" must survive: b also depends on it, and self-eviction
+        // must never delete data that isn't exclusively the flooding
+        // origin's own.
+        assert!(data.entries.contains_key("shared"));
+    }
+
+    #[test]
+    fn evict_sole_owned_entries_for_origin_evicts_oldest_first_until_enough_is_freed() {
+        let a = origin("https://a.example.com");
+        let mut data = CosRegistryData::default();
+        data.entries
+            .insert("oldest".to_owned(), written_entry(10, HashSet::from([a.clone()]), 1));
+        data.entries
+            .insert("middle".to_owned(), written_entry(10, HashSet::from([a.clone()]), 2));
+        data.entries
+            .insert("newest".to_owned(), written_entry(10, HashSet::from([a.clone()]), 3));
+
+        evict_sole_owned_entries_for_origin(&mut data, None, &a, 15);
+
+        assert!(!data.entries.contains_key("oldest"));
+        assert!(!data.entries.contains_key("middle"));
+        assert!(data.entries.contains_key("newest"));
+    }
+
+    #[test]
+    fn evict_globally_lru_evicts_oldest_regardless_of_owner() {
+        let a = origin("https://a.example.com");
+        let b = origin("https://b.example.com");
+        let mut data = CosRegistryData::default();
+        data.entries
+            .insert("as-oldest".to_owned(), written_entry(10, HashSet::from([a.clone()]), 1));
+        data.entries
+            .insert("bs-newer".to_owned(), written_entry(10, HashSet::from([b.clone()]), 2));
+
+        evict_globally_lru(&mut data, None, 10);
+
+        assert!(!data.entries.contains_key("as-oldest"));
+        assert!(data.entries.contains_key("bs-newer"));
+    }
+
+    #[test]
+    fn one_origin_writing_a_lot_never_evicts_a_different_origins_entry() {
+        // Large enough that the *global* budget never becomes the
+        // binding constraint here -- this test is specifically about
+        // the *per-origin share* protecting other origins, isolated from
+        // the (intentionally different, "fair" by design) global
+        // fallback eviction; see
+        // `evict_globally_lru_evicts_oldest_regardless_of_owner` for that
+        // other, expected case.
+        let mut store = store();
+        store.set_fake_free_disk_space(100_000);
+
+        let flooder = origin("https://flooder.example.com");
+        let victim = origin("https://victim.example.com");
+
+        let victim_bytes = b"victim-data".to_vec();
+        let victim_hex = compute_hex_digest("SHA-256", &victim_bytes).unwrap();
+        let victim_hash = hash("SHA-256", &victim_hex);
+        assert!(matches!(
+            store.verify_and_store(
+                &victim_hash,
+                victim_bytes.clone(),
+                "text/plain".to_owned(),
+                victim.clone(),
+                None
+            ),
+            VerifyAndStoreOutcome::Success
+        ));
+
+        // The flooder writes many large, distinct (real hash/content
+        // pairs, not fabricated) entries -- each one big enough that a
+        // handful of them exceed the flooder's own 20% share, forcing
+        // repeated self-eviction of the flooder's *own* earlier entries.
+        for i in 0..50 {
+            let bytes = format!("flood-{i}-{}", "x".repeat(1000)).into_bytes();
+            let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+            let h = hash("SHA-256", &hex);
+            store.verify_and_store(&h, bytes, "text/plain".to_owned(), flooder.clone(), None);
+        }
+
+        // Repeated self-eviction must have kept the flooder's own
+        // footprint well under all 50 entries it attempted (proving
+        // eviction actually happened, not a no-op). Which *specific*
+        // flood entries got evicted isn't asserted: `last_read_unix_secs`
+        // has only 1-second resolution, and this loop writes 50 entries
+        // within a single wall-clock second, so oldest-first tie-breaking
+        // among same-timestamp entries comes down to `HashMap` iteration
+        // order, not creation order -- not deterministic here, though a
+        // real, slower-paced usage pattern wouldn't have that ambiguity.
+        let flooder_entry_count = {
+            let data = store.data.read();
+            data.entries
+                .values()
+                .filter(|entry| entry.storing_origins.contains(&flooder))
+                .count()
+        };
+        assert!(
+            flooder_entry_count < 50,
+            "expected repeated self-eviction to bound the flooder's own entry count, got {flooder_entry_count}"
+        );
+
+        // The victim's entry, which the flooder never touched, must
+        // still be there regardless of which flood entries got evicted.
+        assert!(matches!(
+            store.complete_a_read_request(&victim_hash, &victim),
+            CosReadOutcome::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn consume_write_token_allows_up_to_capacity_then_denies() {
+        let store = store();
+        let o = origin("https://writer.example");
+        let mut allowed = 0;
+        for _ in 0..(WRITE_BUDGET_CAPACITY as usize) {
+            if store.consume_write_token(&o) {
+                allowed += 1;
+            }
+        }
+        assert_eq!(allowed, WRITE_BUDGET_CAPACITY as usize);
+        assert!(!store.consume_write_token(&o));
+    }
+
+    #[test]
+    fn verify_and_store_rejects_with_rate_limited_when_write_budget_exhausted() {
+        let store = store();
+        let o = origin("https://writer.example.com");
+        for _ in 0..(WRITE_BUDGET_CAPACITY as usize) {
+            store.consume_write_token(&o);
+        }
+
+        let bytes = b"over-write-budget".to_vec();
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+        assert!(matches!(
+            store.verify_and_store(&h, bytes, "text/plain".to_owned(), o, None),
+            VerifyAndStoreOutcome::RateLimited
+        ));
+    }
+
+    #[test]
+    fn verify_and_store_rejects_with_quota_exceeded_when_nothing_can_free_enough_room() {
+        let mut store = store();
+        // budget = 0.8 * 100 = 80 bytes; the write below is far bigger
+        // than that, and there is nothing yet to evict to make room.
+        store.set_fake_free_disk_space(100);
+
+        let bytes = vec![0u8; 1000];
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+        let o = origin("https://writer.example.com");
+
+        match store.verify_and_store(&h, bytes, "text/plain".to_owned(), o, None) {
+            VerifyAndStoreOutcome::QuotaExceeded { .. } => {},
+            other => panic!("expected QuotaExceeded, got {other:?}"),
+        }
     }
 
     /// Cheap, dependency-free unique-ish suffix for a temp test directory

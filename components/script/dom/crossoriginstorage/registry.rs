@@ -40,12 +40,13 @@ use std::time::SystemTime;
 pub(crate) use net_traits::cross_origin_storage_thread::{MAX_ORIGINS_LIST_LENGTH, RequestedOrigins};
 
 use net_traits::CoreResourceMsg;
-use net_traits::cross_origin_storage_thread::{CosReadOutcome, CosThreadMsg};
+use net_traits::cross_origin_storage_thread::{CosReadOutcome, CosThreadMsg, VerifyAndStoreOutcome};
 use servo_base::generic_channel::{self, GenericSend};
 use servo_constellation_traits::BlobImpl;
 use servo_url::ImmutableOrigin;
 
 use crate::dom::bindings::error::Error;
+use crate::dom::bindings::num::Finite;
 use crate::dom::bindings::refcounted::TrustedPromise;
 use crate::dom::bindings::str::{DOMString, USVString};
 use crate::dom::crossoriginstorage::filesystemfilehandle::FileSystemFileHandle;
@@ -288,7 +289,7 @@ impl CosVerifyAndStoreResponseHandler {
         }
     }
 
-    fn handle(&mut self, result: Result<(), ()>) {
+    fn handle(&mut self, outcome: VerifyAndStoreOutcome) {
         let Some(trusted_promise) = self.trusted_promise.take() else {
             error!("Cross-Origin Storage verify-and-store response handler called twice.");
             return;
@@ -296,13 +297,27 @@ impl CosVerifyAndStoreResponseHandler {
         self.task_source
             .queue(task!(cos_verify_and_store_response: move |cx| {
                 let promise = trusted_promise.root();
-                match result {
-                    Ok(()) => promise.resolve_native(cx, &()),
+                match outcome {
+                    VerifyAndStoreOutcome::Success => promise.resolve_native(cx, &()),
                     // Step 2 of verify-and-store: reject with DataError on
                     // hash mismatch, leaving the entry unmodified (nothing
                     // to roll back: the registry is only ever mutated on
                     // the success path).
-                    Err(()) => promise.reject_error(cx, Error::Data(None)),
+                    VerifyAndStoreOutcome::HashMismatch => promise.reject_error(cx, Error::Data(None)),
+                    // This implementation's write-probe rate limit (see
+                    // net::cross_origin_storage_thread's doc comment);
+                    // not a spec-defined outcome.
+                    VerifyAndStoreOutcome::RateLimited => promise.reject_error(cx, Error::NotAllowed(None)),
+                    // This implementation's storage budget (see the same
+                    // module's doc comment); not spec-defined either, but
+                    // QuotaExceededError is the standard DOMException for
+                    // exactly this kind of storage-limit situation.
+                    VerifyAndStoreOutcome::QuotaExceeded { quota_bytes, requested_bytes } => {
+                        promise.reject_error(cx, Error::QuotaExceeded {
+                            quota: Some(Finite::wrap(quota_bytes as f64)),
+                            requested: Some(Finite::wrap(requested_bytes as f64)),
+                        });
+                    },
                 }
             }));
     }
@@ -310,10 +325,12 @@ impl CosVerifyAndStoreResponseHandler {
 
 /// <https://wicg.github.io/cross-origin-storage/#verify-and-store>
 ///
-/// Resolves `promise` with `undefined` on success, rejects with
-/// `DataError` on hash mismatch (or if the request could not be
-/// sent/answered at all -- this function's signature does not currently
-/// distinguish "verification failed" from "could not verify").
+/// Resolves `promise` with `undefined` on success; rejects per
+/// `VerifyAndStoreOutcome`'s doc comment (`DataError` on hash mismatch,
+/// or if the request could not be sent/answered at all -- this does not
+/// currently distinguish "verification failed" from "could not verify";
+/// `NotAllowedError`/`QuotaExceededError` for this implementation's own
+/// rate-limit/storage-budget additions).
 pub(crate) fn verify_and_store(
     global: &GlobalScope,
     hash: &CosHash,
@@ -326,8 +343,8 @@ pub(crate) fn verify_and_store(
 ) {
     let mut handler = CosVerifyAndStoreResponseHandler::new(TrustedPromise::new(promise.clone()), task_source);
     let callback = generic_channel::GenericCallback::new(move |message| {
-        let result = message.unwrap_or(Err(()));
-        handler.handle(result);
+        let outcome = message.unwrap_or(VerifyAndStoreOutcome::HashMismatch);
+        handler.handle(outcome);
     })
     .expect("Could not create Cross-Origin Storage verify-and-store callback");
 
@@ -342,7 +359,7 @@ pub(crate) fn verify_and_store(
         ),
     ));
     if sent.is_err() &&
-        let Err(error) = callback.send(Err(()))
+        let Err(error) = callback.send(VerifyAndStoreOutcome::HashMismatch)
     {
         error!("Failed to deliver Cross-Origin Storage verify-and-store response: {error}");
     }

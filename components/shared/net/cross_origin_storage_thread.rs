@@ -134,6 +134,28 @@ pub enum CosReadOutcome {
     PendingWrite,
 }
 
+/// The result of `verify and store`
+/// (<https://wicg.github.io/cross-origin-storage/#verify-and-store>), sent
+/// back over IPC. See `net::cross_origin_storage_thread`'s doc comment for
+/// what enforces `RateLimited`/`QuotaExceeded` and why (this
+/// implementation's own additions, not spec-mandated).
+#[derive(Debug, Deserialize, Serialize)]
+pub enum VerifyAndStoreOutcome {
+    Success,
+    /// Step 2 of `verify and store`: the computed digest did not match
+    /// the requested hash. Also used if the request could not be
+    /// sent/answered at all (this does not currently distinguish
+    /// "verification failed" from "could not verify").
+    HashMismatch,
+    /// This implementation's per-origin write-probe rate limit was
+    /// exceeded.
+    RateLimited,
+    /// This implementation's storage budget (global or per-origin) could
+    /// not accommodate this write, even after evicting every entry it was
+    /// allowed to evict to make room.
+    QuotaExceeded { quota_bytes: u64, requested_bytes: u64 },
+}
+
 /// Messages understood by the Cross-Origin Storage service living in the
 /// resource thread. Reached via
 /// `CoreResourceMsg::ToCrossOriginStorage`, mirroring
@@ -154,16 +176,15 @@ pub enum CosThreadMsg {
     /// a later request for the same hash notices it is stale; see
     /// `CrossOriginStorageStore::abandon_pending_write`.
     AbandonPendingWrite(CosHash),
-    /// `verify and store`. The response is `Ok(())` on success, `Err(())`
-    /// on hash mismatch (caller should reject with `DataError`). Same
-    /// `GenericCallback` reasoning as `Read` above.
+    /// `verify and store`. Same `GenericCallback` reasoning as `Read`
+    /// above.
     VerifyAndStore(
         CosHash,
         Vec<u8>,
         String,
         ImmutableOrigin,
         Option<RequestedOrigins>,
-        GenericCallback<Result<(), ()>>,
+        GenericCallback<VerifyAndStoreOutcome>,
     ),
 }
 
