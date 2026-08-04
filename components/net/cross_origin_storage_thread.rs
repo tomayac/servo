@@ -165,7 +165,7 @@
 //! re-verified by a writer is not the same as being read by some other
 //! origin.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -324,32 +324,49 @@ struct CosRegistryData {
     /// that function's doc comment for why). Kept incrementally in sync
     /// the same way `total_bytes` is, for the same reason.
     per_origin_bytes: HashMap<ImmutableOrigin, u64>,
+    /// Every `Written` entry's `(last_read_unix_secs, key)`, kept in
+    /// sync by the same mutation sites as `total_bytes`/`per_origin_bytes`
+    /// (plus `complete_a_read_request`, since a read alone can change
+    /// `last_read_unix_secs` without any byte total changing) --
+    /// including `key` in the tuple breaks ties between entries sharing
+    /// the same `last_read_unix_secs` (a real possibility: that field
+    /// only has 1-second resolution), giving `evict_matching` a
+    /// well-defined, deterministic walk order instead of depending on
+    /// `HashMap` iteration order. A `BTreeSet` iterates in ascending key
+    /// order, i.e. oldest-last-read-first, so `evict_matching` can walk
+    /// straight from the front instead of collecting every `Written`
+    /// entry into a `Vec` and sorting it on every eviction pass.
+    recency_index: BTreeSet<(u64, String)>,
 }
 
 impl CosRegistryData {
     /// Builds a `CosRegistryData` from already-loaded `entries`,
-    /// computing `total_bytes`/`per_origin_bytes` fresh from them. An
-    /// O(n) scan, same as the old `total_bytes_used`/`origin_storage_usage`
+    /// computing `total_bytes`/`per_origin_bytes`/`recency_index` fresh
+    /// from them. An O(n) scan, same as what `total_bytes_used`/
+    /// `origin_storage_usage`/`evict_matching` used to do on every call
     /// -- fine here since this only runs once, at startup (or in tests
     /// that construct a registry directly rather than through
     /// `verify_and_store`'s incremental bookkeeping), not on every write.
     fn from_entries(entries: HashMap<String, CosEntry>) -> Self {
         let mut total_bytes = 0u64;
         let mut per_origin_bytes: HashMap<ImmutableOrigin, u64> = HashMap::new();
-        for entry in entries.values() {
-            let size = entry_size(entry);
-            if size == 0 {
+        let mut recency_index = BTreeSet::new();
+        for (key, entry) in &entries {
+            if entry.state != CosEntryState::Written {
                 continue;
             }
+            let size = entry_size(entry);
             total_bytes += size;
             for storing_origin in &entry.storing_origins {
                 *per_origin_bytes.entry(storing_origin.clone()).or_insert(0) += size;
             }
+            recency_index.insert((entry.last_read_unix_secs, key.clone()));
         }
         CosRegistryData {
             entries,
             total_bytes,
             per_origin_bytes,
+            recency_index,
         }
     }
 }
@@ -775,28 +792,38 @@ impl CrossOriginStorageStore {
         }
 
         touch_listed_origin(entry, origin);
+
+        // Computed before the `last_read_unix_secs` touch below (rather
+        // than folded into it) so `entry`'s borrow of `data.entries` can
+        // end there instead of being held through to the end of this
+        // function -- `data.recency_index` needs `data`'s other fields
+        // available afterward; see that field's doc comment.
+        let outcome = match &entry.bytes {
+            Some(bytes) => CosReadOutcome::Found {
+                bytes: bytes.bytes.clone(),
+                type_string: bytes.type_string.clone(),
+            },
+            None => CosReadOutcome::NotFound,
+        };
+
         if entry.bytes.is_some() {
             // Drives storage-budget eviction order; see this module's
-            // doc comment on storage budgeting. Set before the match
-            // below (rather than inside its `Some` arm) so this mutable
-            // access to `entry` doesn't overlap with `entry.bytes`'s
-            // shared borrow there.
+            // doc comment on storage budgeting.
+            let old_last_read_unix_secs = entry.last_read_unix_secs;
             entry.last_read_unix_secs = unix_now_secs();
+            let new_last_read_unix_secs = entry.last_read_unix_secs;
             // Persisted immediately, alongside the origins-list touch
             // above: see this module's doc comment on per-entry
             // persistence and on `last_read_unix_secs` for why this is
             // now affordable and necessary for eviction order to survive
             // a restart accurately.
             self.persist_entry(&key, entry);
+            // `entry`'s borrow ends at its last use above.
+            data.recency_index.remove(&(old_last_read_unix_secs, key.clone()));
+            data.recency_index.insert((new_last_read_unix_secs, key));
         }
 
-        match &entry.bytes {
-            Some(bytes) => CosReadOutcome::Found {
-                bytes: bytes.bytes.clone(),
-                type_string: bytes.type_string.clone(),
-            },
-            None => CosReadOutcome::NotFound,
-        }
+        outcome
     }
 
     /// <https://wicg.github.io/cross-origin-storage/#complete-a-create-request>
@@ -999,29 +1026,37 @@ impl CrossOriginStorageStore {
                 last_read_unix_secs: unix_now_secs(),
             });
 
-        // Captured before overwriting `entry.bytes`/`storing_origins`
-        // below, so the running totals (`data.total_bytes`,
+        // Captured before overwriting `entry.bytes`/`last_read_unix_secs`/
+        // `storing_origins` below, so the running totals (`data.total_bytes`,
         // `data.per_origin_bytes`) only ever grow by what is genuinely
         // new: a hash's content can't change, so re-verifying an entry
         // that is already `Written` doesn't add any bytes, and an origin
         // that already stores this entry doesn't gain any new share
-        // usage by re-verifying it either.
+        // usage by re-verifying it either. `old_last_read_unix_secs` is
+        // only meaningful (and only used below) when `!is_first_write`,
+        // since a first write was never in `recency_index` to begin with.
         let is_first_write = entry.bytes.is_none();
+        let old_last_read_unix_secs = entry.last_read_unix_secs;
         entry.bytes = Some(StoredEntryBytes { bytes, type_string });
         entry.state = CosEntryState::Written;
         entry.last_read_unix_secs = unix_now_secs();
+        let new_last_read_unix_secs = entry.last_read_unix_secs;
         let newly_storing_origin = entry.storing_origins.insert(origin.clone());
         upgrade_resource_visibility(entry, requested_origins);
         self.persist_entry(&key, entry);
 
         // `entry`'s borrow of `data.entries` ends at its last use above,
         // so `data`'s other fields can be updated here; see
-        // `CosRegistryData::total_bytes`/`per_origin_bytes`'s doc
-        // comments for why these are kept incrementally in sync instead
-        // of recomputed from `entries` on every call.
+        // `CosRegistryData::total_bytes`/`per_origin_bytes`/
+        // `recency_index`'s doc comments for why these are kept
+        // incrementally in sync instead of recomputed from `entries` on
+        // every call.
         if is_first_write {
             data.total_bytes += new_bytes_len;
+        } else {
+            data.recency_index.remove(&(old_last_read_unix_secs, key.clone()));
         }
+        data.recency_index.insert((new_last_read_unix_secs, key.clone()));
         if newly_storing_origin {
             *data.per_origin_bytes.entry(origin).or_insert(0) += new_bytes_len;
         }
@@ -1206,32 +1241,51 @@ fn per_origin_share(budget: u64) -> u64 {
 /// and `evict_globally_lru`, which differ only in which entries are
 /// eligible in the first place; see those functions' own doc comments
 /// for what `predicate` is for in each case.
+///
+/// Walks `data.recency_index` from the front (oldest first) rather than
+/// collecting every matching entry into a `Vec` and sorting it, so
+/// finding what to evict costs O(k) (k = entries actually visited, not
+/// the size of the registry) for `evict_globally_lru` (`predicate`
+/// accepts everything), and avoids at least the sort for
+/// `evict_sole_owned_entries_for_origin`'s narrower predicate. See
+/// `recency_index`'s own doc comment for why it's safe to rely on being
+/// already sorted here.
 fn evict_matching(
     data: &mut CosRegistryData,
     config_dir: Option<&Path>,
     bytes_needed: u64,
     predicate: impl Fn(&CosEntry) -> bool,
 ) {
-    let mut candidates: Vec<(String, u64, u64)> = data
-        .entries
-        .iter()
-        .filter(|(_, entry)| entry.state == CosEntryState::Written && predicate(entry))
-        .map(|(key, entry)| (key.clone(), entry_size(entry), entry.last_read_unix_secs))
-        .collect();
-    candidates.sort_by_key(|(_, _, last_read_unix_secs)| *last_read_unix_secs);
-
     let mut freed = 0u64;
-    for (key, size, _) in candidates {
+    let mut to_evict: Vec<(u64, String, u64)> = Vec::new();
+    for (last_read_unix_secs, key) in &data.recency_index {
         if freed >= bytes_needed {
             break;
         }
+        let Some(entry) = data.entries.get(key) else {
+            // Would mean `recency_index` and `entries` have drifted out
+            // of sync -- a bookkeeping bug elsewhere, not a reason to
+            // fail this eviction pass.
+            continue;
+        };
+        if !predicate(entry) {
+            continue;
+        }
+        let size = entry_size(entry);
+        freed += size;
+        to_evict.push((*last_read_unix_secs, key.clone(), size));
+    }
+
+    for (last_read_unix_secs, key, size) in to_evict {
         // Removing the entry itself (rather than just its on-disk
-        // files) means `data.total_bytes`/`per_origin_bytes` must be
-        // brought back down to match; see those fields' doc comments.
-        // `saturating_sub` rather than `-=` defensively: if the running
-        // totals and this entry's real size were ever to disagree, that
-        // is a bookkeeping bug, but the eviction itself removing real
-        // bytes from disk must still succeed rather than panic.
+        // files) means `data.total_bytes`/`per_origin_bytes`/
+        // `recency_index` must be brought back down to match; see those
+        // fields' doc comments. `saturating_sub` rather than `-=`
+        // defensively: if the running totals and this entry's real size
+        // were ever to disagree, that is a bookkeeping bug, but the
+        // eviction itself removing real bytes from disk must still
+        // succeed rather than panic.
+        data.recency_index.remove(&(last_read_unix_secs, key.clone()));
         if let Some(removed) = data.entries.remove(&key) {
             data.total_bytes = data.total_bytes.saturating_sub(size);
             for storing_origin in &removed.storing_origins {
@@ -1242,7 +1296,6 @@ fn evict_matching(
         }
         delete_entry_bytes_file(config_dir, &key);
         delete_entry_metadata_file(config_dir, &key);
-        freed += size;
     }
 }
 
@@ -1822,9 +1875,10 @@ mod tests {
         bytes: Vec<u8>,
     ) {
         let size = bytes.len() as u64;
+        let key = registry_key(hash);
         let mut data = store.data.write();
         data.entries.insert(
-            registry_key(hash),
+            key.clone(),
             CosEntry {
                 bytes: Some(StoredEntryBytes {
                     bytes,
@@ -1839,10 +1893,11 @@ mod tests {
         );
         // Kept in sync with the direct insert above, matching what
         // `verify_and_store` itself would do; see
-        // `CosRegistryData::total_bytes`/`per_origin_bytes`'s doc
-        // comments.
+        // `CosRegistryData::total_bytes`/`per_origin_bytes`/
+        // `recency_index`'s doc comments.
         data.total_bytes += size;
         *data.per_origin_bytes.entry(storing_origin).or_insert(0) += size;
+        data.recency_index.insert((0, key));
     }
 
     #[test]
@@ -2632,6 +2687,57 @@ mod tests {
                 "per_origin_bytes drifted from a fresh scan for {origin_value:?}"
             );
         }
+    }
+
+    #[test]
+    fn recency_index_stays_in_sync_with_every_written_entrys_last_read_unix_secs() {
+        // Regression test for `CosRegistryData::recency_index`: exercises
+        // every mutation site that touches it -- a fresh write, a read
+        // (which moves an entry's position by changing
+        // `last_read_unix_secs` without touching any byte total),
+        // re-verification by a different origin, and enough further
+        // writes to force eviction -- then checks the incrementally
+        // maintained index against a full scan.
+        let mut store = store();
+        store.set_fake_total_disk_space(100_000);
+
+        let a = origin("https://a.example.com");
+        let b = origin("https://b.example.com");
+
+        let bytes = b"tracked-content".to_vec();
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+        assert!(matches!(
+            store.verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), a.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
+        assert!(matches!(
+            store.complete_a_read_request(&h, &a),
+            CosReadOutcome::Found { .. }
+        ));
+        assert!(matches!(
+            store.verify_and_store(&h, bytes, "text/plain".to_owned(), b.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
+
+        for i in 0..30 {
+            let flood_bytes = format!("flood-{i}-{}", "x".repeat(1000)).into_bytes();
+            let flood_hex = compute_hex_digest("SHA-256", &flood_bytes).unwrap();
+            let flood_hash = hash("SHA-256", &flood_hex);
+            store.verify_and_store(&flood_hash, flood_bytes, "text/plain".to_owned(), a.clone(), None);
+        }
+
+        let data = store.data.read();
+        let expected: BTreeSet<(u64, String)> = data
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.state == CosEntryState::Written)
+            .map(|(key, entry)| (entry.last_read_unix_secs, key.clone()))
+            .collect();
+        assert_eq!(
+            data.recency_index, expected,
+            "recency_index drifted from a fresh scan over Written entries"
+        );
     }
 
     #[test]
