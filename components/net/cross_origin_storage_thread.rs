@@ -313,6 +313,18 @@ struct PendingWriteSession {
     received_bytes: u64,
     hasher: digest::Context,
     staging: PendingWriteStaging,
+    /// Set by `write_chunk` if a `PendingWriteStaging::File` write ever
+    /// fails (e.g. the disk fills up partway through a large streamed
+    /// write -- a realistic occurrence, not just a theoretical one, given
+    /// this feature's target use case of multi-hundred-MiB shards).
+    /// `received_bytes` and `hasher` are updated unconditionally in
+    /// `write_chunk`, before the fallible disk write, so on their own
+    /// they can't distinguish a chunk that was genuinely received and
+    /// persisted from one that was received but never made it to disk;
+    /// `finish_write` checks this flag first and refuses to publish the
+    /// entry if it's set, rather than trusting a hash/byte-count that no
+    /// longer describes what is actually on disk.
+    io_failed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -1204,6 +1216,7 @@ impl CrossOriginStorageStore {
             received_bytes: 0,
             hasher: digest::Context::new(algorithm),
             staging,
+            io_failed: false,
         });
     }
 
@@ -1229,6 +1242,12 @@ impl CrossOriginStorageStore {
                         "Could not write Cross-Origin Storage streamed write chunk to {}: {err}",
                         temp_path.display()
                     );
+                    // `received_bytes`/`hasher` above already reflect this
+                    // chunk regardless of whether it actually reached
+                    // disk; see `PendingWriteSession::io_failed`'s doc
+                    // comment for why `finish_write` needs this flag to
+                    // tell the difference.
+                    session.io_failed = true;
                 }
             },
         }
@@ -1252,7 +1271,21 @@ impl CrossOriginStorageStore {
             received_bytes,
             hasher,
             staging,
+            io_failed,
         } = session;
+
+        // Checked before anything else: if a chunk ever failed to reach
+        // disk, `received_bytes` and `hasher` below already reflect it
+        // regardless (see `PendingWriteSession::io_failed`'s doc
+        // comment), so neither the byte-count nor the digest check that
+        // follow can be trusted to catch this on their own -- both would
+        // still pass, and publishing the entry at that point would mean
+        // serving corrupt bytes under a hash that was verified against a
+        // digest the bytes on disk no longer actually match.
+        if io_failed {
+            discard_staging(&staging);
+            return VerifyAndStoreOutcome::HashMismatch;
+        }
 
         // The digest can only ever be right if exactly the declared
         // number of bytes actually arrived; this is not a check on
@@ -3488,6 +3521,40 @@ mod tests {
 
         // And the incomplete write must not have been published as a
         // readable entry either.
+        assert!(matches!(
+            store.complete_a_read_request(&h, &writer),
+            CosReadOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn finish_write_rejects_with_hash_mismatch_when_a_chunk_failed_to_reach_disk() {
+        let store = store();
+        let bytes = b"looks-fine-in-memory-but-disk-write-failed".to_vec();
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+        let writer = origin("https://writer.example");
+
+        let session_id = WriteSessionId(1);
+        store.begin_write(session_id, h.clone(), writer.clone(), bytes.len() as u64);
+        store.write_chunk(session_id, bytes);
+
+        // Simulates what `write_chunk` itself sets when a
+        // `PendingWriteStaging::File` write fails (e.g. the disk fills up
+        // mid-write): `received_bytes` and the digest are already
+        // correct at this point regardless (the in-memory bookkeeping
+        // has no way to know the disk write failed), so this is the only
+        // way to exercise `finish_write`'s handling of that without a
+        // real, flaky, hard-to-trigger disk-full condition.
+        store.write_sessions.lock().get_mut(&session_id).unwrap().io_failed = true;
+
+        assert!(matches!(
+            store.finish_write(session_id, "text/plain".to_owned(), None),
+            VerifyAndStoreOutcome::HashMismatch
+        ));
+
+        // Must not have been published as a readable entry despite the
+        // byte count and hash both having checked out.
         assert!(matches!(
             store.complete_a_read_request(&h, &writer),
             CosReadOutcome::NotFound
