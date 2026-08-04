@@ -1036,8 +1036,17 @@ const GREASE_MAX_SIZE_BYTES: usize = 500 * 1024;
 /// rather than assumed) are treated as size `0` and are therefore always
 /// eligible -- there is nothing to make an expensive re-download of.
 fn should_grease(entry: &CosEntry) -> bool {
-    let size = entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len());
-    size < GREASE_MAX_SIZE_BYTES && rand::random_bool(GREASE_PROBABILITY)
+    entry_size(entry) < GREASE_MAX_SIZE_BYTES as u64 && rand::random_bool(GREASE_PROBABILITY)
+}
+
+/// The number of bytes `entry` currently occupies, or `0` if it has no
+/// stored bytes yet (a `Pending` entry, or a `Written` one whose bytes
+/// failed to load from disk at startup; see
+/// `CrossOriginStorageStore::load_entries_from_disk`). Shared by every
+/// place that needs an entry's size: `should_grease`, `total_bytes_used`,
+/// `origin_storage_usage`, and `evict_matching`.
+fn entry_size(entry: &CosEntry) -> u64 {
+    entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len() as u64)
 }
 
 /// Fraction of (free disk space + bytes already used by Cross-Origin
@@ -1095,10 +1104,7 @@ const PER_ORIGIN_STORAGE_SHARE_FRACTION: f64 = 0.2;
 /// module's doc comment on `CrossOriginStorageStore::new`, so this is a
 /// cheap in-memory sum, not a disk scan).
 fn total_bytes_used(data: &CosRegistryData) -> u64 {
-    data.entries
-        .values()
-        .map(|entry| entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len() as u64))
-        .sum()
+    data.entries.values().map(entry_size).sum()
 }
 
 /// Total bytes of every entry `origin` is a storing origin for. An entry
@@ -1112,7 +1118,7 @@ fn origin_storage_usage(data: &CosRegistryData, origin: &ImmutableOrigin) -> u64
     data.entries
         .values()
         .filter(|entry| entry.storing_origins.contains(origin))
-        .map(|entry| entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len() as u64))
+        .map(entry_size)
         .sum()
 }
 
@@ -1131,6 +1137,38 @@ fn per_origin_share(budget: u64) -> u64 {
     (budget as f64 * PER_ORIGIN_STORAGE_SHARE_FRACTION) as u64
 }
 
+/// Evicts `Written` entries matching `predicate`, oldest-last-read-first,
+/// until at least `bytes_needed` are freed or there are no more eligible
+/// entries. Shared implementation for `evict_sole_owned_entries_for_origin`
+/// and `evict_globally_lru`, which differ only in which entries are
+/// eligible in the first place; see those functions' own doc comments
+/// for what `predicate` is for in each case.
+fn evict_matching(
+    data: &mut CosRegistryData,
+    config_dir: Option<&Path>,
+    bytes_needed: u64,
+    predicate: impl Fn(&CosEntry) -> bool,
+) {
+    let mut candidates: Vec<(String, u64, u64)> = data
+        .entries
+        .iter()
+        .filter(|(_, entry)| entry.state == CosEntryState::Written && predicate(entry))
+        .map(|(key, entry)| (key.clone(), entry_size(entry), entry.last_read_unix_secs))
+        .collect();
+    candidates.sort_by_key(|(_, _, last_read_unix_secs)| *last_read_unix_secs);
+
+    let mut freed = 0u64;
+    for (key, size, _) in candidates {
+        if freed >= bytes_needed {
+            break;
+        }
+        data.entries.remove(&key);
+        delete_entry_bytes_file(config_dir, &key);
+        delete_entry_metadata_file(config_dir, &key);
+        freed += size;
+    }
+}
+
 /// Evicts `origin`'s own *sole-owned* `Written` entries (ones where it
 /// is the only storing origin), oldest-last-read-first, until at least
 /// `bytes_needed` are freed or there are no more eligible entries.
@@ -1147,31 +1185,9 @@ fn evict_sole_owned_entries_for_origin(
     origin: &ImmutableOrigin,
     bytes_needed: u64,
 ) {
-    let mut candidates: Vec<(String, u64, u64)> = data
-        .entries
-        .iter()
-        .filter(|(_, entry)| {
-            entry.state == CosEntryState::Written &&
-                entry.storing_origins.len() == 1 &&
-                entry.storing_origins.contains(origin)
-        })
-        .map(|(key, entry)| {
-            let size = entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len() as u64);
-            (key.clone(), size, entry.last_read_unix_secs)
-        })
-        .collect();
-    candidates.sort_by_key(|(_, _, last_read_unix_secs)| *last_read_unix_secs);
-
-    let mut freed = 0u64;
-    for (key, size, _) in candidates {
-        if freed >= bytes_needed {
-            break;
-        }
-        data.entries.remove(&key);
-        delete_entry_bytes_file(config_dir, &key);
-        delete_entry_metadata_file(config_dir, &key);
-        freed += size;
-    }
+    evict_matching(data, config_dir, bytes_needed, |entry| {
+        entry.storing_origins.len() == 1 && entry.storing_origins.contains(origin)
+    });
 }
 
 /// Evicts `Written` entries regardless of owner, oldest-last-read-first,
@@ -1183,27 +1199,7 @@ fn evict_sole_owned_entries_for_origin(
 /// the explainer itself suggests for storage pressure generally) is a
 /// fair policy here.
 fn evict_globally_lru(data: &mut CosRegistryData, config_dir: Option<&Path>, bytes_needed: u64) {
-    let mut candidates: Vec<(String, u64, u64)> = data
-        .entries
-        .iter()
-        .filter(|(_, entry)| entry.state == CosEntryState::Written)
-        .map(|(key, entry)| {
-            let size = entry.bytes.as_ref().map_or(0, |bytes| bytes.bytes.len() as u64);
-            (key.clone(), size, entry.last_read_unix_secs)
-        })
-        .collect();
-    candidates.sort_by_key(|(_, _, last_read_unix_secs)| *last_read_unix_secs);
-
-    let mut freed = 0u64;
-    for (key, size, _) in candidates {
-        if freed >= bytes_needed {
-            break;
-        }
-        data.entries.remove(&key);
-        delete_entry_bytes_file(config_dir, &key);
-        delete_entry_metadata_file(config_dir, &key);
-        freed += size;
-    }
+    evict_matching(data, config_dir, bytes_needed, |_| true);
 }
 
 /// Deletes an evicted entry's per-entry bytes file, if `config_dir` is
