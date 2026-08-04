@@ -647,6 +647,24 @@ pub struct CrossOriginStorageStore {
     fake_total_disk_space: Option<u64>,
 }
 
+/// What `complete_a_read_request` should do about one entry, independent
+/// of whether the caller holds a read or write lock on the registry --
+/// shared between its fast (read-lock) and slow (write-lock) paths so
+/// this state/staleness/availability-gating decision is only ever
+/// written once, even though it needs to be evaluated under both locks
+/// (see `complete_a_read_request`'s doc comment on why the slow path
+/// re-decides rather than trusting the fast path's answer).
+enum ReadRequestDecision {
+    /// Nothing to disclose; `complete_a_read_request` returns this
+    /// `CosReadOutcome` immediately without mutating the entry.
+    Early(CosReadOutcome),
+    /// A genuine, disclosed hit: the entry must be touched
+    /// (`touch_listed_origin`, and its `last_read_unix_secs` if it has
+    /// bytes) before a final `CosReadOutcome` can be produced -- only
+    /// ever returned from under a write lock.
+    Disclosed,
+}
+
 impl CrossOriginStorageStore {
     pub fn new(config_dir: Option<PathBuf>) -> Self {
         let mut entries = HashMap::new();
@@ -890,6 +908,35 @@ impl CrossOriginStorageStore {
         }
     }
 
+    /// The state/staleness/availability-gating part of
+    /// <https://wicg.github.io/cross-origin-storage/#complete-a-read-request>,
+    /// factored out of `complete_a_read_request` so it can be evaluated
+    /// identically under either a read or a write lock; see
+    /// `ReadRequestDecision`.
+    fn decide_read_request(
+        &self,
+        entry: &CosEntry,
+        hash: &CosHash,
+        origin: &ImmutableOrigin,
+    ) -> ReadRequestDecision {
+        if entry.state == CosEntryState::Pending {
+            // A stale Pending entry is treated as if it were never
+            // created, per this module's doc comment: an abandoned write
+            // must not permanently block readers behind PendingWrite.
+            return ReadRequestDecision::Early(if is_stale_pending(entry) {
+                CosReadOutcome::NotFound
+            } else {
+                CosReadOutcome::PendingWrite
+            });
+        }
+
+        if !self.apply_availability_gating(entry, hash, origin) {
+            return ReadRequestDecision::Early(CosReadOutcome::NotFound);
+        }
+
+        ReadRequestDecision::Disclosed
+    }
+
     /// <https://wicg.github.io/cross-origin-storage/#complete-a-read-request>
     fn complete_a_read_request(&self, hash: &CosHash, origin: &ImmutableOrigin) -> CosReadOutcome {
         // Every read is a probe (see this module's doc comment); an
@@ -901,30 +948,48 @@ impl CrossOriginStorageStore {
             return CosReadOutcome::NotFound;
         }
 
-        // A write lock, not a read lock: a successful list-scoped read
-        // mutates the entry's origins list order (`touch_listed_origin`,
-        // see this module's doc comment on the LRU merge policy), so
-        // this needs mutable access even though it's conceptually "just
-        // a read" from the caller's perspective.
-        let mut data = self.data.write();
         let key = registry_key(hash);
+
+        // Fast path: a shared read lock is enough for every outcome that
+        // doesn't end up mutating the registry -- no such entry, still
+        // Pending, or denied by availability gating. This is the common
+        // case for a probe fishing for a hash nobody has stored, or one
+        // this origin isn't allowed to see; see this module's doc
+        // comment on `Arc<RwLock<..>>` for why this distinction is worth
+        // making even though, with a single resource thread today, it
+        // has no observable effect yet.
+        {
+            let data = self.data.read();
+            match data.entries.get(&key) {
+                None => return CosReadOutcome::NotFound,
+                Some(entry) => {
+                    if let ReadRequestDecision::Early(outcome) =
+                        self.decide_read_request(entry, hash, origin)
+                    {
+                        return outcome;
+                    }
+                },
+            }
+        }
+
+        // Slow path: a genuine, disclosed hit -- upgrading to a write
+        // lock to record it (`touch_listed_origin`, and its
+        // `last_read_unix_secs` below). Re-decides from scratch rather
+        // than trusting what the read lock above observed: that lock was
+        // dropped before this one was taken, so in principle another
+        // writer could have changed or removed the entry in between (not
+        // possible today, with a single resource thread serializing
+        // every message -- see this module's doc comment on
+        // `Arc<RwLock<..>>` -- but this function must stay correct
+        // regardless of that, not merely by accident of there currently
+        // being only one caller).
+        let mut data = self.data.write();
         let Some(entry) = data.entries.get_mut(&key) else {
             return CosReadOutcome::NotFound;
         };
 
-        if entry.state == CosEntryState::Pending {
-            // A stale Pending entry is treated as if it were never
-            // created, per this module's doc comment: an abandoned write
-            // must not permanently block readers behind PendingWrite.
-            return if is_stale_pending(entry) {
-                CosReadOutcome::NotFound
-            } else {
-                CosReadOutcome::PendingWrite
-            };
-        }
-
-        if !self.apply_availability_gating(entry, hash, origin) {
-            return CosReadOutcome::NotFound;
+        if let ReadRequestDecision::Early(outcome) = self.decide_read_request(entry, hash, origin) {
+            return outcome;
         }
 
         touch_listed_origin(entry, origin);
@@ -992,14 +1057,31 @@ impl CrossOriginStorageStore {
             return;
         }
 
+        let key = registry_key(hash);
+
+        // Fast path: a shared read lock is enough to rule out the
+        // common, idempotent case -- a repeated create() for a hash that
+        // already has a fresh (non-stale) entry -- without ever taking
+        // the exclusive lock; see this module's doc comment on
+        // `Arc<RwLock<..>>`.
+        {
+            let data = self.data.read();
+            if matches!(data.entries.get(&key), Some(existing) if !is_stale_pending(existing)) {
+                return;
+            }
+        }
+
         let normalized = match requested_origins {
             None => CosOrigins::SameSiteOnly,
             Some(RequestedOrigins::Wildcard) => CosOrigins::Wildcard,
             Some(RequestedOrigins::List(origins)) => CosOrigins::List(origins),
         };
 
+        // Slow path: re-decides from scratch under the write lock rather
+        // than trusting the read lock above, for the same
+        // stay-correct-under-real-concurrency reason as
+        // `complete_a_read_request`'s own fast/slow split.
         let mut data = self.data.write();
-        let key = registry_key(hash);
         // A stale Pending entry from an abandoned write is replaced with
         // a fresh one, same as if the hash had never been requested
         // before; see this module's doc comment. A Written entry, or a
@@ -1034,12 +1116,28 @@ impl CrossOriginStorageStore {
 
     /// See `CosThreadMsg::AbandonPendingWrite`.
     fn abandon_pending_write(&self, hash: &CosHash) {
-        let mut data = self.data.write();
         let key = registry_key(hash);
-        // Only remove it while still Pending: if another origin's write
-        // for the same hash already completed (a genuinely concurrent
-        // write racing this now-aborted one), that Written entry must
-        // survive this abort.
+
+        // Fast path: a shared read lock is enough to rule out the
+        // common case -- nothing Pending for this hash (the write
+        // already finished, or this hash was never staged) -- without
+        // ever taking the exclusive lock; see this module's doc comment
+        // on `Arc<RwLock<..>>`.
+        {
+            let data = self.data.read();
+            if !matches!(data.entries.get(&key), Some(entry) if entry.state == CosEntryState::Pending) {
+                return;
+            }
+        }
+
+        // Slow path: re-checks under the write lock rather than trusting
+        // the read lock above, for the same stay-correct-under-real-
+        // concurrency reason as `complete_a_read_request`'s own
+        // fast/slow split. Only remove it while still Pending: if
+        // another origin's write for the same hash already completed (a
+        // genuinely concurrent write racing this now-aborted one), that
+        // Written entry must survive this abort.
+        let mut data = self.data.write();
         if matches!(data.entries.get(&key), Some(entry) if entry.state == CosEntryState::Pending) {
             data.entries.remove(&key);
             delete_entry_metadata_file(self.config_dir.as_deref(), &key);
