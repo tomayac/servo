@@ -10,6 +10,7 @@
 import base64
 import csv
 import glob
+import hashlib
 import json
 import os
 import os.path as path
@@ -156,6 +157,13 @@ class MachCommands(CommandBase):
             "https://media.githubusercontent.com/media/WICG/cross-origin-storage"
             "/main/public-hash-list/implementation/data/public-hash-list.dat"
         )
+        # A same-repo, same-directory `.sha256` checksum of `list_url`'s
+        # exact contents, in the standard `sha256sum`-compatible
+        # "<hex digest>  <filename>" format; verifying against it here
+        # protects against a corrupted/truncated download or a
+        # MITM'd/compromised LFS media response, given this file gets
+        # compiled directly into every Servo build.
+        checksum_url = list_url + ".sha256"
         dst_filename = path.join(
             self.context.topdir,
             "components",
@@ -166,8 +174,18 @@ class MachCommands(CommandBase):
 
         try:
             content = download_bytes("Public Hash List", list_url)
+            checksum_content = download_bytes("Public Hash List checksum", checksum_url)
         except urllib.error.URLError:
             print("Unable to download the Public Hash List; are you connected to the internet?")
+            sys.exit(1)
+
+        expected_sha256 = checksum_content.decode("utf8").split()[0]
+        actual_sha256 = hashlib.sha256(content).hexdigest()
+        if actual_sha256 != expected_sha256:
+            print(
+                f"Public Hash List checksum mismatch: expected {expected_sha256}, got {actual_sha256}. "
+                "Not updating the bundled snapshot."
+            )
             sys.exit(1)
 
         # Bundled as sorted, packed 32-byte digests (no delimiters, no
