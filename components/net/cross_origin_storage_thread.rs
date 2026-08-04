@@ -1915,6 +1915,11 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Test-only convenience: production code hashes incrementally instead
+/// (`digest_algorithm` + `digest::Context`, driven by `begin_write`/
+/// `write_chunk`/`finish_write`), but tests still want a simple one-shot
+/// way to compute the expected digest for a chunk of test bytes.
+#[cfg(test)]
 fn compute_hex_digest(algorithm: &str, bytes: &[u8]) -> Option<String> {
     let algorithm = digest_algorithm(algorithm)?;
     Some(hex_encode(digest::digest(algorithm, bytes).as_ref()))
