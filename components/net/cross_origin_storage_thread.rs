@@ -517,6 +517,21 @@ const PROBE_BUDGET_REFILL_PER_SECOND: f64 = 20.0;
 const WRITE_BUDGET_CAPACITY: f64 = 200.0;
 const WRITE_BUDGET_REFILL_PER_SECOND: f64 = 2.0;
 
+/// Upper bound on the number of distinct origins tracked at once in
+/// either `probe_budgets` or `write_budgets`. Without this cap, either
+/// map would grow by one `TokenBucket` per distinct origin ever seen,
+/// for the life of the process, with no eviction -- unlike the registry
+/// itself, which enforces `MAX_ORIGINS_LIST_LENGTH` and a storage
+/// budget. A long-running session that visits many different sites using
+/// Cross-Origin Storage would leak memory here slowly but permanently.
+/// Sized generously above any realistic number of distinct origins a
+/// single browsing session would use Cross-Origin Storage from, so a
+/// legitimate page essentially never notices the cap; see
+/// `evict_least_recently_used_bucket` for what eviction actually costs
+/// an evicted origin (effectively nothing, beyond that one origin's
+/// current burst).
+const TOKEN_BUCKET_MAP_MAX_ORIGINS: usize = 10_000;
+
 /// One requesting origin's rate-limit state for either the read-probe or
 /// write-probe budget (each origin gets one bucket per budget kind); see
 /// `consume_token`.
@@ -544,6 +559,15 @@ fn consume_token(
 ) -> bool {
     let mut buckets = buckets.lock();
     let now = Instant::now();
+
+    // Only ever makes room for a genuinely new origin -- an already-
+    // tracked one reuses its existing entry below regardless of how full
+    // the map is, so this can't evict the very bucket this call is about
+    // to touch.
+    if !buckets.contains_key(origin) && buckets.len() >= TOKEN_BUCKET_MAP_MAX_ORIGINS {
+        evict_least_recently_used_bucket(&mut buckets);
+    }
+
     let bucket = buckets.entry(origin.clone()).or_insert_with(|| TokenBucket {
         tokens: capacity,
         last_refill: now,
@@ -558,6 +582,27 @@ fn consume_token(
         true
     } else {
         false
+    }
+}
+
+/// Evicts the single bucket least recently touched by any `consume_token`
+/// call (a denial updates `last_refill` exactly the same as a successful
+/// consumption, so it doubles as a recency signal without needing a
+/// separate index); see `TOKEN_BUCKET_MAP_MAX_ORIGINS`. Only ever called
+/// with `buckets` already at capacity, so there is always at least one
+/// entry to evict. A plain O(n) scan, not an incremental index like
+/// `CosRegistryData::recency_index`: this only runs when a genuinely new
+/// origin arrives while the map is already full, which -- unlike
+/// eviction in the registry itself -- is not on every single write, just
+/// however often a browsing session's distinct-origin count grows past
+/// this cap.
+fn evict_least_recently_used_bucket(buckets: &mut HashMap<ImmutableOrigin, TokenBucket>) {
+    if let Some(oldest) = buckets
+        .iter()
+        .min_by_key(|(_, bucket)| bucket.last_refill)
+        .map(|(origin, _)| origin.clone())
+    {
+        buckets.remove(&oldest);
     }
 }
 
@@ -2280,6 +2325,33 @@ mod tests {
         // At PROBE_BUDGET_REFILL_PER_SECOND tokens/sec, 200ms refills
         // ~4 tokens -- comfortably at least 1, so this must now succeed.
         assert!(store.consume_probe_token(&o));
+    }
+
+    #[test]
+    fn probe_budgets_never_exceeds_its_cap_and_evicts_the_least_recently_used_origin() {
+        let store = store();
+
+        // Fills the map to exactly its cap, oldest first -- so
+        // `origins[0]`, touched here and never again, is the least
+        // recently used entry once every other one has also been
+        // touched at least this once.
+        let origins: Vec<ImmutableOrigin> = (0..TOKEN_BUCKET_MAP_MAX_ORIGINS)
+            .map(|i| origin(&format!("https://origin-{i}.example")))
+            .collect();
+        for o in &origins {
+            store.consume_probe_token(o);
+        }
+        assert_eq!(store.probe_budgets.lock().len(), TOKEN_BUCKET_MAP_MAX_ORIGINS);
+
+        // One more, genuinely new origin must evict the least-recently-
+        // used bucket rather than growing the map past its cap.
+        let newcomer = origin("https://newcomer.example");
+        store.consume_probe_token(&newcomer);
+
+        let buckets = store.probe_budgets.lock();
+        assert_eq!(buckets.len(), TOKEN_BUCKET_MAP_MAX_ORIGINS);
+        assert!(!buckets.contains_key(&origins[0]));
+        assert!(buckets.contains_key(&newcomer));
     }
 
     #[test]
