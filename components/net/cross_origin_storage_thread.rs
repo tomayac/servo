@@ -306,6 +306,52 @@ fn is_stale_pending(entry: &CosEntry) -> bool {
 #[derive(Default)]
 struct CosRegistryData {
     entries: HashMap<String, CosEntry>,
+    /// Running total of `entry_size()` across every `Written` entry,
+    /// equal at all times to `entries.values().map(entry_size).sum()`.
+    /// Kept incrementally in sync by every mutation site
+    /// (`verify_and_store`'s success path adds to it, `evict_matching`'s
+    /// removal loop subtracts from it) instead of being recomputed by
+    /// scanning `entries` on every call, which is what `total_bytes_used`
+    /// used to do directly -- an O(n) scan on every single write does not
+    /// scale to the number of entries this feature targets (many
+    /// AI-model shards). Entries loaded from disk at startup don't go
+    /// through that incremental path, so this is computed fresh once by
+    /// `CosRegistryData::from_entries` instead.
+    total_bytes: u64,
+    /// Running total of `entry_size()` per storing origin, mirroring
+    /// `origin_storage_usage`'s semantics: an entry's full size counts
+    /// against *every* one of its storing origins, not divided up (see
+    /// that function's doc comment for why). Kept incrementally in sync
+    /// the same way `total_bytes` is, for the same reason.
+    per_origin_bytes: HashMap<ImmutableOrigin, u64>,
+}
+
+impl CosRegistryData {
+    /// Builds a `CosRegistryData` from already-loaded `entries`,
+    /// computing `total_bytes`/`per_origin_bytes` fresh from them. An
+    /// O(n) scan, same as the old `total_bytes_used`/`origin_storage_usage`
+    /// -- fine here since this only runs once, at startup (or in tests
+    /// that construct a registry directly rather than through
+    /// `verify_and_store`'s incremental bookkeeping), not on every write.
+    fn from_entries(entries: HashMap<String, CosEntry>) -> Self {
+        let mut total_bytes = 0u64;
+        let mut per_origin_bytes: HashMap<ImmutableOrigin, u64> = HashMap::new();
+        for entry in entries.values() {
+            let size = entry_size(entry);
+            if size == 0 {
+                continue;
+            }
+            total_bytes += size;
+            for storing_origin in &entry.storing_origins {
+                *per_origin_bytes.entry(storing_origin.clone()).or_insert(0) += size;
+            }
+        }
+        CosRegistryData {
+            entries,
+            total_bytes,
+            per_origin_bytes,
+        }
+    }
 }
 
 /// On-disk shape of one entry's metadata file (`entry_metadata_path()`),
@@ -457,7 +503,7 @@ impl CrossOriginStorageStore {
         if let Some(dir) = &config_dir {
             entries = Self::load_entries_from_disk(dir);
         }
-        let data = CosRegistryData { entries };
+        let data = CosRegistryData::from_entries(entries);
         CrossOriginStorageStore {
             data: Arc::new(RwLock::new(data)),
             config_dir,
@@ -953,12 +999,32 @@ impl CrossOriginStorageStore {
                 last_read_unix_secs: unix_now_secs(),
             });
 
+        // Captured before overwriting `entry.bytes`/`storing_origins`
+        // below, so the running totals (`data.total_bytes`,
+        // `data.per_origin_bytes`) only ever grow by what is genuinely
+        // new: a hash's content can't change, so re-verifying an entry
+        // that is already `Written` doesn't add any bytes, and an origin
+        // that already stores this entry doesn't gain any new share
+        // usage by re-verifying it either.
+        let is_first_write = entry.bytes.is_none();
         entry.bytes = Some(StoredEntryBytes { bytes, type_string });
         entry.state = CosEntryState::Written;
         entry.last_read_unix_secs = unix_now_secs();
-        entry.storing_origins.insert(origin);
+        let newly_storing_origin = entry.storing_origins.insert(origin.clone());
         upgrade_resource_visibility(entry, requested_origins);
         self.persist_entry(&key, entry);
+
+        // `entry`'s borrow of `data.entries` ends at its last use above,
+        // so `data`'s other fields can be updated here; see
+        // `CosRegistryData::total_bytes`/`per_origin_bytes`'s doc
+        // comments for why these are kept incrementally in sync instead
+        // of recomputed from `entries` on every call.
+        if is_first_write {
+            data.total_bytes += new_bytes_len;
+        }
+        if newly_storing_origin {
+            *data.per_origin_bytes.entry(origin).or_insert(0) += new_bytes_len;
+        }
 
         VerifyAndStoreOutcome::Success
     }
@@ -1100,11 +1166,10 @@ const GLOBAL_STORAGE_BUDGET_FRACTION: f64 = 0.6;
 const PER_ORIGIN_STORAGE_SHARE_FRACTION: f64 = 0.2;
 
 /// Total bytes of every `Written` entry's stored bytes across the whole
-/// registry (entry bytes already live in memory once loaded; see this
-/// module's doc comment on `CrossOriginStorageStore::new`, so this is a
-/// cheap in-memory sum, not a disk scan).
+/// registry. An O(1) read of `data.total_bytes`, not a scan over
+/// `entries`; see that field's doc comment for why.
 fn total_bytes_used(data: &CosRegistryData) -> u64 {
-    data.entries.values().map(entry_size).sum()
+    data.total_bytes
 }
 
 /// Total bytes of every entry `origin` is a storing origin for. An entry
@@ -1113,13 +1178,11 @@ fn total_bytes_used(data: &CosRegistryData) -> u64 {
 /// *every* one of them, not divided up: this measures how much each
 /// origin has itself chosen to write/verify, not how many physical bytes
 /// are on disk, and dividing it up would let an origin get "free" quota
-/// usage by re-verifying content someone else already stored.
+/// usage by re-verifying content someone else already stored. An O(1)
+/// read of `data.per_origin_bytes`, not a scan over `entries`; see that
+/// field's doc comment for why.
 fn origin_storage_usage(data: &CosRegistryData, origin: &ImmutableOrigin) -> u64 {
-    data.entries
-        .values()
-        .filter(|entry| entry.storing_origins.contains(origin))
-        .map(entry_size)
-        .sum()
+    data.per_origin_bytes.get(origin).copied().unwrap_or(0)
 }
 
 /// The current global storage budget in bytes: a stable fraction of
@@ -1162,7 +1225,21 @@ fn evict_matching(
         if freed >= bytes_needed {
             break;
         }
-        data.entries.remove(&key);
+        // Removing the entry itself (rather than just its on-disk
+        // files) means `data.total_bytes`/`per_origin_bytes` must be
+        // brought back down to match; see those fields' doc comments.
+        // `saturating_sub` rather than `-=` defensively: if the running
+        // totals and this entry's real size were ever to disagree, that
+        // is a bookkeeping bug, but the eviction itself removing real
+        // bytes from disk must still succeed rather than panic.
+        if let Some(removed) = data.entries.remove(&key) {
+            data.total_bytes = data.total_bytes.saturating_sub(size);
+            for storing_origin in &removed.storing_origins {
+                if let Some(total) = data.per_origin_bytes.get_mut(storing_origin) {
+                    *total = total.saturating_sub(size);
+                }
+            }
+        }
         delete_entry_bytes_file(config_dir, &key);
         delete_entry_metadata_file(config_dir, &key);
         freed += size;
@@ -1744,6 +1821,7 @@ mod tests {
         origins: CosOrigins,
         bytes: Vec<u8>,
     ) {
+        let size = bytes.len() as u64;
         let mut data = store.data.write();
         data.entries.insert(
             registry_key(hash),
@@ -1754,11 +1832,17 @@ mod tests {
                 }),
                 state: CosEntryState::Written,
                 origins,
-                storing_origins: HashSet::from([storing_origin]),
+                storing_origins: HashSet::from([storing_origin.clone()]),
                 pending_since_unix_secs: 0,
                 last_read_unix_secs: 0,
             },
         );
+        // Kept in sync with the direct insert above, matching what
+        // `verify_and_store` itself would do; see
+        // `CosRegistryData::total_bytes`/`per_origin_bytes`'s doc
+        // comments.
+        data.total_bytes += size;
+        *data.per_origin_bytes.entry(storing_origin).or_insert(0) += size;
     }
 
     #[test]
@@ -2343,9 +2427,10 @@ mod tests {
 
     #[test]
     fn total_bytes_used_sums_every_written_entrys_bytes() {
-        let mut data = CosRegistryData::default();
-        data.entries.insert("a".to_owned(), written_entry(10, HashSet::new(), 0));
-        data.entries.insert("b".to_owned(), written_entry(25, HashSet::new(), 0));
+        let data = CosRegistryData::from_entries(HashMap::from([
+            ("a".to_owned(), written_entry(10, HashSet::new(), 0)),
+            ("b".to_owned(), written_entry(25, HashSet::new(), 0)),
+        ]));
         assert_eq!(total_bytes_used(&data), 35);
     }
 
@@ -2353,15 +2438,11 @@ mod tests {
     fn origin_storage_usage_only_counts_entries_the_origin_stores() {
         let a = origin("https://a.example.com");
         let b = origin("https://b.example.com");
-        let mut data = CosRegistryData::default();
-        data.entries
-            .insert("owned-by-a".to_owned(), written_entry(10, HashSet::from([a.clone()]), 0));
-        data.entries
-            .insert("owned-by-b".to_owned(), written_entry(20, HashSet::from([b.clone()]), 0));
-        data.entries.insert(
-            "shared".to_owned(),
-            written_entry(5, HashSet::from([a.clone(), b.clone()]), 0),
-        );
+        let data = CosRegistryData::from_entries(HashMap::from([
+            ("owned-by-a".to_owned(), written_entry(10, HashSet::from([a.clone()]), 0)),
+            ("owned-by-b".to_owned(), written_entry(20, HashSet::from([b.clone()]), 0)),
+            ("shared".to_owned(), written_entry(5, HashSet::from([a.clone(), b.clone()]), 0)),
+        ]));
         assert_eq!(origin_storage_usage(&data, &a), 15); // 10 + 5
         assert_eq!(origin_storage_usage(&data, &b), 25); // 20 + 5
     }
@@ -2370,13 +2451,10 @@ mod tests {
     fn evict_sole_owned_entries_for_origin_never_touches_a_shared_entry() {
         let a = origin("https://a.example.com");
         let b = origin("https://b.example.com");
-        let mut data = CosRegistryData::default();
-        data.entries
-            .insert("sole-owned".to_owned(), written_entry(10, HashSet::from([a.clone()]), 100));
-        data.entries.insert(
-            "shared".to_owned(),
-            written_entry(50, HashSet::from([a.clone(), b.clone()]), 50),
-        );
+        let mut data = CosRegistryData::from_entries(HashMap::from([
+            ("sole-owned".to_owned(), written_entry(10, HashSet::from([a.clone()]), 100)),
+            ("shared".to_owned(), written_entry(50, HashSet::from([a.clone(), b.clone()]), 50)),
+        ]));
 
         // Ask for more than the sole-owned entry alone can free -- if
         // shared entries were eligible, evicting "shared" too would
@@ -2393,13 +2471,11 @@ mod tests {
     #[test]
     fn evict_sole_owned_entries_for_origin_evicts_oldest_first_until_enough_is_freed() {
         let a = origin("https://a.example.com");
-        let mut data = CosRegistryData::default();
-        data.entries
-            .insert("oldest".to_owned(), written_entry(10, HashSet::from([a.clone()]), 1));
-        data.entries
-            .insert("middle".to_owned(), written_entry(10, HashSet::from([a.clone()]), 2));
-        data.entries
-            .insert("newest".to_owned(), written_entry(10, HashSet::from([a.clone()]), 3));
+        let mut data = CosRegistryData::from_entries(HashMap::from([
+            ("oldest".to_owned(), written_entry(10, HashSet::from([a.clone()]), 1)),
+            ("middle".to_owned(), written_entry(10, HashSet::from([a.clone()]), 2)),
+            ("newest".to_owned(), written_entry(10, HashSet::from([a.clone()]), 3)),
+        ]));
 
         evict_sole_owned_entries_for_origin(&mut data, None, &a, 15);
 
@@ -2412,11 +2488,10 @@ mod tests {
     fn evict_globally_lru_evicts_oldest_regardless_of_owner() {
         let a = origin("https://a.example.com");
         let b = origin("https://b.example.com");
-        let mut data = CosRegistryData::default();
-        data.entries
-            .insert("as-oldest".to_owned(), written_entry(10, HashSet::from([a.clone()]), 1));
-        data.entries
-            .insert("bs-newer".to_owned(), written_entry(10, HashSet::from([b.clone()]), 2));
+        let mut data = CosRegistryData::from_entries(HashMap::from([
+            ("as-oldest".to_owned(), written_entry(10, HashSet::from([a.clone()]), 1)),
+            ("bs-newer".to_owned(), written_entry(10, HashSet::from([b.clone()]), 2)),
+        ]));
 
         evict_globally_lru(&mut data, None, 10);
 
@@ -2491,6 +2566,72 @@ mod tests {
             store.complete_a_read_request(&victim_hash, &victim),
             CosReadOutcome::Found { .. }
         ));
+    }
+
+    #[test]
+    fn running_byte_totals_stay_in_sync_with_a_fresh_scan_across_writes_and_eviction() {
+        // Regression test for `CosRegistryData::total_bytes`/
+        // `per_origin_bytes`: exercises a realistic mix of operations
+        // (a fresh write, the same content re-verified by a second
+        // origin so an entry gains a storing origin without growing,
+        // and enough further writes to force self-eviction) through the
+        // real store, then checks the incrementally-maintained totals
+        // against a full scan -- proving `total_bytes_used`/
+        // `origin_storage_usage`'s O(1) reads never drift from the truth.
+        let mut store = store();
+        store.set_fake_total_disk_space(100_000);
+
+        let a = origin("https://a.example.com");
+        let b = origin("https://b.example.com");
+
+        let shared_bytes = b"shared-content".to_vec();
+        let shared_hex = compute_hex_digest("SHA-256", &shared_bytes).unwrap();
+        let shared_hash = hash("SHA-256", &shared_hex);
+        assert!(matches!(
+            store.verify_and_store(&shared_hash, shared_bytes.clone(), "text/plain".to_owned(), a.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
+        // Re-verified by a different origin: `shared_hash`'s entry gains
+        // a second storing origin without its own size changing.
+        assert!(matches!(
+            store.verify_and_store(&shared_hash, shared_bytes.clone(), "text/plain".to_owned(), b.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
+        // Re-verified again by the *same* origin: must not double-count.
+        assert!(matches!(
+            store.verify_and_store(&shared_hash, shared_bytes, "text/plain".to_owned(), a.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
+
+        // Enough further writes from `a` to force repeated self-eviction
+        // (see `one_origin_writing_a_lot_never_evicts_a_different_origins_entry`
+        // above for why this specific shape triggers it).
+        for i in 0..30 {
+            let bytes = format!("flood-{i}-{}", "x".repeat(1000)).into_bytes();
+            let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+            let h = hash("SHA-256", &hex);
+            store.verify_and_store(&h, bytes, "text/plain".to_owned(), a.clone(), None);
+        }
+
+        let data = store.data.read();
+        let expected_total: u64 = data.entries.values().map(entry_size).sum();
+        assert_eq!(
+            data.total_bytes, expected_total,
+            "total_bytes drifted from a fresh scan over entries"
+        );
+
+        for (origin_value, &running_total) in &data.per_origin_bytes {
+            let expected: u64 = data
+                .entries
+                .values()
+                .filter(|entry| entry.storing_origins.contains(origin_value))
+                .map(entry_size)
+                .sum();
+            assert_eq!(
+                running_total, expected,
+                "per_origin_bytes drifted from a fresh scan for {origin_value:?}"
+            );
+        }
     }
 
     #[test]
