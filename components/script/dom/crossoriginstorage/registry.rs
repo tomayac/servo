@@ -41,7 +41,9 @@ use std::time::SystemTime;
 pub(crate) use net_traits::cross_origin_storage_thread::{MAX_ORIGINS_LIST_LENGTH, RequestedOrigins};
 
 use net_traits::CoreResourceMsg;
-use net_traits::cross_origin_storage_thread::{CosReadOutcome, CosThreadMsg, VerifyAndStoreOutcome};
+use net_traits::cross_origin_storage_thread::{
+    CosReadOutcome, CosThreadMsg, VerifyAndStoreOutcome, WriteSessionId,
+};
 use servo_base::generic_channel::{self, GenericSend};
 use servo_constellation_traits::BlobImpl;
 use servo_url::ImmutableOrigin;
@@ -336,6 +338,15 @@ impl CosVerifyAndStoreResponseHandler {
     }
 }
 
+/// Chunk size `verify_and_store` splits `bytes` into for the `WriteChunk`
+/// messages that follow `BeginWrite`; see `CosThreadMsg`'s doc comment for
+/// why the resource thread wants this streamed rather than sent as one
+/// message. Not a correctness-relevant value -- just small enough that a
+/// multi-hundred-MiB write doesn't turn into one multi-hundred-MiB IPC
+/// message (defeating the point), and large enough that a large write
+/// doesn't turn into an excessive number of tiny ones.
+const WRITE_CHUNK_BYTES: usize = 1024 * 1024;
+
 /// <https://wicg.github.io/cross-origin-storage/#verify-and-store>
 ///
 /// Resolves `promise` with `undefined` on success; rejects per
@@ -344,6 +355,13 @@ impl CosVerifyAndStoreResponseHandler {
 /// currently distinguish "verification failed" from "could not verify";
 /// `NotAllowedError`/`QuotaExceededError` for this implementation's own
 /// rate-limit/storage-budget additions).
+///
+/// Sends `bytes` to the resource thread as a `BeginWrite` followed by one
+/// or more `WriteChunk`s and a final `FinishWrite`, per `CosThreadMsg`'s
+/// doc comment, all tagged with a single random `WriteSessionId` --
+/// `bytes` itself is still fully assembled here in script first (see that
+/// doc comment for why), so this only streams the resource-thread side of
+/// the transfer, not script's own memory use.
 pub(crate) fn verify_and_store(
     global: &GlobalScope,
     hash: &CosHash,
@@ -361,16 +379,27 @@ pub(crate) fn verify_and_store(
     })
     .expect("Could not create Cross-Origin Storage verify-and-store callback");
 
-    let sent = global.resource_threads().send(CoreResourceMsg::ToCrossOriginStorage(
-        CosThreadMsg::VerifyAndStore(
-            hash.clone(),
-            bytes,
-            type_string,
-            origin,
-            requested_origins,
-            callback.clone(),
-        ),
+    let session_id = WriteSessionId(rand::random());
+    let resource_threads = global.resource_threads();
+
+    let mut sent = resource_threads.send(CoreResourceMsg::ToCrossOriginStorage(
+        CosThreadMsg::BeginWrite(session_id, hash.clone(), origin.clone(), bytes.len() as u64),
     ));
+    if sent.is_ok() {
+        for chunk in bytes.chunks(WRITE_CHUNK_BYTES) {
+            sent = resource_threads.send(CoreResourceMsg::ToCrossOriginStorage(
+                CosThreadMsg::WriteChunk(session_id, chunk.to_vec()),
+            ));
+            if sent.is_err() {
+                break;
+            }
+        }
+    }
+    if sent.is_ok() {
+        sent = resource_threads.send(CoreResourceMsg::ToCrossOriginStorage(
+            CosThreadMsg::FinishWrite(session_id, type_string, requested_origins, callback.clone()),
+        ));
+    }
     if sent.is_err() &&
         let Err(error) = callback.send(VerifyAndStoreOutcome::HashMismatch)
     {

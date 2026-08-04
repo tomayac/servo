@@ -104,8 +104,9 @@
 //! Every entry lives under `config_dir/cos_entries/` as a pair of sibling
 //! files, both named after `registry_key()`'s sanitized form: `<key>.json`
 //! (metadata -- state, origins, storing-origins, timestamps; written by
-//! `persist_entry()`) and `<key>.bin` (raw bytes, written by
-//! `persist_entry_bytes()`, only for a `Written` entry). Keeping bytes out
+//! `persist_entry()`) and `<key>.bin` (raw bytes, streamed directly to disk
+//! by `write_chunk`/`finish_write` -- see `PendingWriteStaging::File` --
+//! only for a `Written` entry). Keeping bytes out
 //! of the metadata file means a mutation that only touches metadata (e.g.
 //! a fresh `Pending` entry from `complete_a_create_request`) never has to
 //! rewrite any entry's bytes, and vice versa. Metadata is itself split
@@ -166,21 +167,32 @@
 //! origin.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use aws_lc_rs::digest;
 use log::warn;
 use net_traits::cross_origin_storage_thread::{
     CosHash, CosReadOutcome, CosThreadMsg, MAX_ORIGINS_LIST_LENGTH, RequestedOrigins,
-    VerifyAndStoreOutcome,
+    VerifyAndStoreOutcome, WriteSessionId,
 };
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use servo_url::ImmutableOrigin;
 
 const ENTRY_BYTES_DIR: &str = "cos_entries";
+
+/// Source of unique `WriteSessionId`s for the `#[cfg(test)]` `verify_and_store`
+/// wrapper; a real caller (`registry.rs`) generates a random one instead
+/// (see `CosThreadMsg::BeginWrite`'s doc comment), but tests want
+/// deterministic, guaranteed-unique IDs across many calls in the same
+/// process instead of relying on randomness never colliding.
+#[cfg(test)]
+static NEXT_TEST_WRITE_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 /// How long a `Pending` entry is left alone before `complete_a_read_request`
 /// and `complete_a_create_request` treat it as abandoned; see this
@@ -219,6 +231,23 @@ fn entry_metadata_path(config_dir: &Path, key: &str) -> PathBuf {
         .join(format!("{}.json", sanitized_entry_key(key)))
 }
 
+/// Path of the temp file one streamed write session's chunks are
+/// appended to while in progress; see `PendingWriteSession`'s doc
+/// comment for the streaming mechanism, and why this is keyed by
+/// `WriteSessionId` rather than by the target hash (unlike
+/// `entry_bytes_path`/`entry_metadata_path`'s own temp files, which
+/// `write_file_atomically` names after their final path instead, safe
+/// there since that temp file's lifetime never outlives one synchronous
+/// function call). Lives alongside entry bytes/metadata files, but its
+/// `.tmp` extension means `load_entries_from_disk`'s directory scan
+/// (which only looks at `.json` files, and proactively deletes any
+/// `.tmp` leftovers -- see its doc comment) already leaves it alone
+/// while a session is genuinely in progress, and cleans it up if one
+/// never finishes (e.g. the browser crashes mid-write).
+fn write_session_temp_path(config_dir: &Path, session_id: WriteSessionId) -> PathBuf {
+    config_dir.join(ENTRY_BYTES_DIR).join(format!("write-session-{}.tmp", session_id.0))
+}
+
 /// Writes `contents` to `path` atomically with respect to a crash or
 /// power loss: writes to a sibling temp file first (named after `path`'s
 /// own file name, so two different entries' files can never collide on
@@ -227,8 +256,11 @@ fn entry_metadata_path(config_dir: &Path, key: &str) -> PathBuf {
 /// alongside its destination -- is atomic on every platform this needs to
 /// run on, so a reader can never observe a truncated or partially-written
 /// file: `path` is always either its previous complete contents or its
-/// new complete contents, never something in between. Used for both
-/// `persist_entry`'s metadata JSON and `persist_entry_bytes`'s raw bytes.
+/// new complete contents, never something in between. Used for
+/// `persist_entry`'s metadata JSON; entry bytes are instead written
+/// directly by the streaming temp-file-then-rename in `write_chunk`/
+/// `finish_write` (see `PendingWriteStaging::File`), which amounts to the
+/// same atomicity guarantee without needing this helper.
 fn write_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let temp_path = path.with_file_name(format!(
         "{}.tmp",
@@ -241,6 +273,46 @@ fn write_file_atomically(path: &Path, contents: &[u8]) -> std::io::Result<()> {
         return Err(err);
     }
     std::fs::rename(&temp_path, path)
+}
+
+/// Where a streamed write session's chunks are staged as they arrive;
+/// see `PendingWriteSession`.
+enum PendingWriteStaging {
+    /// `config_dir: None` (only in tests, via the `#[cfg(test)]`
+    /// `verify_and_store` wrapper): chunks accumulate in memory instead
+    /// of a temp file, since there is no real directory to put one in.
+    /// Mirrors how `persist_entry` already skips real disk I/O the same
+    /// way for the same reason.
+    InMemory(Vec<u8>),
+    /// The real case: chunks are appended to a temp file on disk as
+    /// they arrive, so this session never needs its whole content
+    /// resident in memory at once; see `write_session_temp_path`.
+    /// `final_path` (where `temp_path` gets renamed to on success) is
+    /// precomputed at `begin_write` time so `finish_write` does not
+    /// need `config_dir` again to derive it.
+    File {
+        temp_path: PathBuf,
+        final_path: PathBuf,
+        file: std::fs::File,
+    },
+}
+
+/// State for one in-progress streamed write, tracked between its
+/// `BeginWrite` and `FinishWrite` messages; see `CosThreadMsg`'s doc
+/// comment for the streaming protocol and
+/// `CrossOriginStorageStore::begin_write`/`write_chunk`/`finish_write`
+/// for how it's used.
+struct PendingWriteSession {
+    hash: CosHash,
+    origin: ImmutableOrigin,
+    /// The exact byte count declared in this session's `BeginWrite`;
+    /// `finish_write` rejects the write if `received_bytes` (the actual
+    /// total received across every `WriteChunk`) doesn't match this
+    /// exactly.
+    declared_total_bytes: u64,
+    received_bytes: u64,
+    hasher: digest::Context,
+    staging: PendingWriteStaging,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -504,6 +576,15 @@ pub struct CrossOriginStorageStore {
     /// `consume_write_token`. Same not-persisted reasoning as
     /// `probe_budgets` above.
     write_budgets: Arc<Mutex<HashMap<ImmutableOrigin, TokenBucket>>>,
+    /// In-progress streamed writes, keyed by the `WriteSessionId` their
+    /// `BeginWrite` message declared; see `PendingWriteSession` and
+    /// `CosThreadMsg`'s doc comment for the streaming protocol. Not part
+    /// of `CosRegistryData`: this is transient upload state, not
+    /// registry content, and (like the rate-limit budgets above)
+    /// correctly does not survive a restart -- a write that was still
+    /// streaming when the browser closed was never acknowledged as
+    /// successful to script either.
+    write_sessions: Arc<Mutex<HashMap<WriteSessionId, PendingWriteSession>>>,
     /// Test-only override for `query_free_disk_space` (the internal,
     /// never-reported safety-net check -- see
     /// `GLOBAL_STORAGE_BUDGET_FRACTION`'s doc comment). `None` in
@@ -533,6 +614,7 @@ impl CrossOriginStorageStore {
             config_dir,
             probe_budgets: Arc::new(Mutex::new(HashMap::new())),
             write_budgets: Arc::new(Mutex::new(HashMap::new())),
+            write_sessions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             fake_free_disk_space: None,
             #[cfg(test)]
@@ -545,6 +627,15 @@ impl CrossOriginStorageStore {
     /// persistence), rather than reading one combined file. A file that
     /// can't be read or decoded is skipped with a warning -- one corrupt
     /// entry must not prevent every other entry from loading.
+    ///
+    /// Also deletes any leftover `.tmp` file found along the way: both
+    /// `write_file_atomically`'s own temp files (which should never
+    /// outlive one synchronous function call, but could if the process
+    /// crashed mid-write) and `write_session_temp_path`'s streamed-write
+    /// staging files (which could be orphaned the same way if a session
+    /// began but never finished -- e.g. the browser closed mid-write)
+    /// are safe to discard on the next startup: neither ever represents
+    /// data any successful operation was told about.
     fn load_entries_from_disk(dir: &Path) -> HashMap<String, CosEntry> {
         let mut entries = HashMap::new();
         let read_dir = match std::fs::read_dir(dir.join(ENTRY_BYTES_DIR)) {
@@ -559,6 +650,12 @@ impl CrossOriginStorageStore {
         };
         for dir_entry in read_dir.flatten() {
             let path = dir_entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("tmp") {
+                if let Err(err) = std::fs::remove_file(&path) {
+                    warn!("Could not delete leftover Cross-Origin Storage temp file at {}: {err}", path.display());
+                }
+                continue;
+            }
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
@@ -694,10 +791,11 @@ impl CrossOriginStorageStore {
 
     /// Persists one entry's metadata (state, origins, storing-origins,
     /// timestamps) to its own file -- deliberately not entry bytes, which
-    /// go through `persist_entry_bytes` instead; see this module's doc
-    /// comment on per-entry persistence. Written via `write_file_atomically`
-    /// rather than `servo_base::write_json_to_file`, since a crash mid-write
-    /// must never leave a corrupt entry behind.
+    /// are already written to disk directly by `write_chunk`/`finish_write`'s
+    /// streaming temp-file-then-rename (see `PendingWriteStaging::File`);
+    /// see this module's doc comment on per-entry persistence. Written via
+    /// `write_file_atomically` rather than `servo_base::write_json_to_file`,
+    /// since a crash mid-write must never leave a corrupt entry behind.
     fn persist_entry(&self, key: &str, entry: &CosEntry) {
         let Some(dir) = &self.config_dir else {
             return;
@@ -721,25 +819,6 @@ impl CrossOriginStorageStore {
         }
     }
 
-    /// Persists one entry's raw bytes to its own file, alongside (not
-    /// combined with) its metadata; see `persist_entry` and this module's
-    /// doc comment on per-entry persistence.
-    fn persist_entry_bytes(&self, key: &str, bytes: &[u8]) {
-        let Some(dir) = &self.config_dir else {
-            return;
-        };
-        let path = entry_bytes_path(dir, key);
-        if let Some(parent) = path.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                warn!("Could not create {}: {err}", parent.display());
-                return;
-            }
-        }
-        if let Err(err) = write_file_atomically(&path, bytes) {
-            warn!("Could not write Cross-Origin Storage entry bytes to {}: {err}", path.display());
-        }
-    }
-
     /// Message handler, mirroring `FileManager::handle`.
     pub fn handle(&self, msg: CosThreadMsg) {
         match msg {
@@ -753,9 +832,14 @@ impl CrossOriginStorageStore {
             CosThreadMsg::AbandonPendingWrite(hash) => {
                 self.abandon_pending_write(&hash);
             },
-            CosThreadMsg::VerifyAndStore(hash, bytes, type_string, origin, requested_origins, response_sender) => {
-                let outcome =
-                    self.verify_and_store(&hash, bytes, type_string, origin, requested_origins);
+            CosThreadMsg::BeginWrite(session_id, hash, origin, total_bytes) => {
+                self.begin_write(session_id, hash, origin, total_bytes);
+            },
+            CosThreadMsg::WriteChunk(session_id, chunk) => {
+                self.write_chunk(session_id, chunk);
+            },
+            CosThreadMsg::FinishWrite(session_id, type_string, requested_origins, response_sender) => {
+                let outcome = self.finish_write(session_id, type_string, requested_origins);
                 let _ = response_sender.send(outcome);
             },
         }
@@ -917,28 +1001,135 @@ impl CrossOriginStorageStore {
         }
     }
 
-    /// <https://wicg.github.io/cross-origin-storage/#verify-and-store>
-    fn verify_and_store(
+    /// Begins a streamed `verify and store`; see `CosThreadMsg::BeginWrite`'s
+    /// doc comment for the full protocol. Deliberately does not create a
+    /// session (so, from script's perspective, the write is silently
+    /// rejected -- `finish_write` reports `RateLimited` when it finds no
+    /// tracked session, since that is the only way one can be missing)
+    /// if the write-probe rate limit is already exhausted, matching
+    /// `verify_and_store`'s old behavior of checking this before doing
+    /// any real work. Also does not create a session for an
+    /// unrecognized algorithm, or (only possible in tests that construct
+    /// a `CrossOriginStorageStore` directly rather than through the
+    /// `#[cfg(test)]` `verify_and_store` wrapper below) a missing
+    /// `config_dir`; both are defense in depth, not reachable from a
+    /// real caller, since `CosHash::validate` already rejects an
+    /// unrecognized algorithm before a write can ever be attempted.
+    fn begin_write(
         &self,
-        hash: &CosHash,
-        bytes: Vec<u8>,
-        type_string: String,
+        session_id: WriteSessionId,
+        hash: CosHash,
         origin: ImmutableOrigin,
+        declared_total_bytes: u64,
+    ) {
+        if !self.consume_write_token(&origin) {
+            return;
+        }
+        let Some(algorithm) = digest_algorithm(&hash.algorithm) else {
+            warn!("Cross-Origin Storage BeginWrite with an unrecognized algorithm: {}", hash.algorithm);
+            return;
+        };
+        let staging = match &self.config_dir {
+            Some(dir) => {
+                let temp_path = write_session_temp_path(dir, session_id);
+                let Some(parent) = temp_path.parent() else {
+                    return;
+                };
+                if let Err(err) = std::fs::create_dir_all(parent) {
+                    warn!("Could not create {}: {err}", parent.display());
+                    return;
+                }
+                let file = match std::fs::File::create(&temp_path) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        warn!("Could not create {}: {err}", temp_path.display());
+                        return;
+                    },
+                };
+                PendingWriteStaging::File {
+                    final_path: entry_bytes_path(dir, &registry_key(&hash)),
+                    temp_path,
+                    file,
+                }
+            },
+            None => PendingWriteStaging::InMemory(Vec::new()),
+        };
+        self.write_sessions.lock().insert(session_id, PendingWriteSession {
+            hash,
+            origin,
+            declared_total_bytes,
+            received_bytes: 0,
+            hasher: digest::Context::new(algorithm),
+            staging,
+        });
+    }
+
+    /// One chunk of a streamed write previously begun by `begin_write`;
+    /// see `CosThreadMsg::WriteChunk`'s doc comment. A chunk for a
+    /// `WriteSessionId` with no tracked session (the write-probe rate
+    /// limit was already exhausted at `begin_write` time, or this is a
+    /// stray/duplicate message) is silently dropped -- there is nowhere
+    /// meaningful for it to go, and `finish_write` is what eventually
+    /// reports the rejection back to script.
+    fn write_chunk(&self, session_id: WriteSessionId, chunk: Vec<u8>) {
+        let mut sessions = self.write_sessions.lock();
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return;
+        };
+        session.hasher.update(&chunk);
+        session.received_bytes += chunk.len() as u64;
+        match &mut session.staging {
+            PendingWriteStaging::InMemory(buffer) => buffer.extend_from_slice(&chunk),
+            PendingWriteStaging::File { temp_path, file, .. } => {
+                if let Err(err) = file.write_all(&chunk) {
+                    warn!(
+                        "Could not write Cross-Origin Storage streamed write chunk to {}: {err}",
+                        temp_path.display()
+                    );
+                }
+            },
+        }
+    }
+
+    /// Finalizes a streamed write; see `CosThreadMsg::FinishWrite`'s doc
+    /// comment. <https://wicg.github.io/cross-origin-storage/#verify-and-store>
+    fn finish_write(
+        &self,
+        session_id: WriteSessionId,
+        type_string: String,
         requested_origins: Option<RequestedOrigins>,
     ) -> VerifyAndStoreOutcome {
-        if !self.consume_write_token(&origin) {
+        let Some(session) = self.write_sessions.lock().remove(&session_id) else {
             return VerifyAndStoreOutcome::RateLimited;
-        }
-
-        let Some(computed_hex) = compute_hex_digest(&hash.algorithm, &bytes) else {
-            return VerifyAndStoreOutcome::HashMismatch;
         };
-        if computed_hex != hash.value.to_ascii_lowercase() {
+        let PendingWriteSession {
+            hash,
+            origin,
+            declared_total_bytes,
+            received_bytes,
+            hasher,
+            staging,
+        } = session;
+
+        // The digest can only ever be right if exactly the declared
+        // number of bytes actually arrived; this is not a check on
+        // anything an attacker controls (see `CosThreadMsg`'s doc
+        // comment -- this protocol is internal to this implementation,
+        // not exposed to web content directly), just defense in depth
+        // against a bug in this implementation's own chunking.
+        if received_bytes != declared_total_bytes {
+            discard_staging(&staging);
             return VerifyAndStoreOutcome::HashMismatch;
         }
 
-        let key = registry_key(hash);
-        let new_bytes_len = bytes.len() as u64;
+        let computed_hex = hex_encode(hasher.finish().as_ref());
+        if computed_hex != hash.value.to_ascii_lowercase() {
+            discard_staging(&staging);
+            return VerifyAndStoreOutcome::HashMismatch;
+        }
+
+        let key = registry_key(&hash);
+        let new_bytes_len = declared_total_bytes;
 
         // Held for the whole operation below (quota check, eviction, and
         // the disk write itself), unlike a plain metadata mutation
@@ -978,6 +1169,7 @@ impl CrossOriginStorageStore {
                     // so nothing further needs persisting here on
                     // rejection; see this module's doc comment on
                     // per-entry persistence.
+                    discard_staging(&staging);
                     return VerifyAndStoreOutcome::QuotaExceeded {
                         quota_bytes: share,
                         requested_bytes: new_bytes_len,
@@ -992,6 +1184,7 @@ impl CrossOriginStorageStore {
             evict_globally_lru(&mut data, self.config_dir.as_deref(), needed);
             if total_bytes_used(&data) + new_bytes_len > budget {
                 // Same reasoning as the per-origin-share rejection above.
+                discard_staging(&staging);
                 return VerifyAndStoreOutcome::QuotaExceeded {
                     quota_bytes: budget,
                     requested_bytes: new_bytes_len,
@@ -1018,6 +1211,7 @@ impl CrossOriginStorageStore {
             let needed = new_bytes_len - self.query_free_disk_space();
             evict_globally_lru(&mut data, self.config_dir.as_deref(), needed);
             if new_bytes_len > self.query_free_disk_space() {
+                discard_staging(&staging);
                 return VerifyAndStoreOutcome::QuotaExceeded {
                     quota_bytes: budget,
                     requested_bytes: new_bytes_len,
@@ -1025,7 +1219,49 @@ impl CrossOriginStorageStore {
             }
         }
 
-        self.persist_entry_bytes(&key, &bytes);
+        // Publishes the staged bytes as this hash's real entry: for a
+        // real temp file, a rename (atomic, and the bytes are already on
+        // disk -- no re-write needed) followed by one read-back to
+        // populate the in-memory cache (`StoredEntryBytes::bytes`; see
+        // its doc comment), since streaming never held the whole thing
+        // in memory to begin with. For the in-memory (`config_dir: None`,
+        // tests only) case, there is nothing to rename -- the
+        // accumulated buffer just becomes the cache directly.
+        let bytes = match staging {
+            PendingWriteStaging::InMemory(buffer) => Arc::new(buffer),
+            PendingWriteStaging::File { temp_path, final_path, file } => {
+                drop(file);
+                if let Err(err) = std::fs::rename(&temp_path, &final_path) {
+                    warn!(
+                        "Could not publish Cross-Origin Storage streamed write to {}: {err}",
+                        final_path.display()
+                    );
+                    let _ = std::fs::remove_file(&temp_path);
+                    return VerifyAndStoreOutcome::HashMismatch;
+                }
+                match std::fs::read(&final_path) {
+                    Ok(bytes) => Arc::new(bytes),
+                    Err(err) => {
+                        // The entry is genuinely, correctly written and
+                        // accounted for on disk at this point -- only
+                        // the in-memory cache failed to populate. Rare
+                        // (a disk read failing immediately after a
+                        // successful write to the same file) enough,
+                        // and non-fatal enough (self-heals on the next
+                        // `CrossOriginStorageStore::new()`, which loads
+                        // straight from disk), that logging loudly and
+                        // proceeding with an empty cache is preferable
+                        // to reporting failure for a write that, on
+                        // disk, actually succeeded.
+                        warn!(
+                            "Could not read back just-published Cross-Origin Storage entry bytes at {}: {err}",
+                            final_path.display()
+                        );
+                        Arc::new(Vec::new())
+                    },
+                }
+            },
+        };
 
         let entry = data
             .entries
@@ -1050,7 +1286,7 @@ impl CrossOriginStorageStore {
         // since a first write was never in `recency_index` to begin with.
         let is_first_write = entry.bytes.is_none();
         let old_last_read_unix_secs = entry.last_read_unix_secs;
-        entry.bytes = Some(StoredEntryBytes { bytes: Arc::new(bytes), type_string });
+        entry.bytes = Some(StoredEntryBytes { bytes, type_string });
         entry.state = CosEntryState::Written;
         entry.last_read_unix_secs = unix_now_secs();
         let new_last_read_unix_secs = entry.last_read_unix_secs;
@@ -1075,6 +1311,32 @@ impl CrossOriginStorageStore {
         }
 
         VerifyAndStoreOutcome::Success
+    }
+
+    /// Test-only convenience wrapper matching the pre-streaming
+    /// `verify_and_store` signature: drives the real `begin_write`/
+    /// `write_chunk`/`finish_write` protocol (split into multiple chunks,
+    /// to genuinely exercise the streaming path rather than special-casing
+    /// a single chunk) so the many existing tests written against a
+    /// single-call, single-buffer API didn't all need rewriting for a
+    /// resource-thread-internal implementation detail.
+    #[cfg(test)]
+    fn verify_and_store(
+        &self,
+        hash: &CosHash,
+        bytes: Vec<u8>,
+        type_string: String,
+        origin: ImmutableOrigin,
+        requested_origins: Option<RequestedOrigins>,
+    ) -> VerifyAndStoreOutcome {
+        const TEST_CHUNK_SIZE: usize = 7;
+
+        let session_id = WriteSessionId(NEXT_TEST_WRITE_SESSION_ID.fetch_add(1, Ordering::Relaxed));
+        self.begin_write(session_id, hash.clone(), origin, bytes.len() as u64);
+        for chunk in bytes.chunks(TEST_CHUNK_SIZE) {
+            self.write_chunk(session_id, chunk.to_vec());
+        }
+        self.finish_write(session_id, type_string, requested_origins)
     }
 
     /// <https://wicg.github.io/cross-origin-storage/#apply-availability-gating>
@@ -1492,21 +1754,38 @@ fn touch_listed_origin(entry: &mut CosEntry, origin: &ImmutableOrigin) {
     }
 }
 
+/// The `aws_lc_rs` algorithm constant for a `CosHash::algorithm` string, or
+/// `None` for an algorithm this implementation doesn't recognize. Shared
+/// between `compute_hex_digest` (one-shot, used by tests) and `begin_write`
+/// (incremental, used by the real streaming write path).
+fn digest_algorithm(algorithm: &str) -> Option<&'static digest::Algorithm> {
+    match algorithm.to_ascii_uppercase().as_str() {
+        "SHA-1" => Some(&digest::SHA1_FOR_LEGACY_USE_ONLY),
+        "SHA-256" => Some(&digest::SHA256),
+        "SHA-384" => Some(&digest::SHA384),
+        "SHA-512" => Some(&digest::SHA512),
+        _ => None,
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 fn compute_hex_digest(algorithm: &str, bytes: &[u8]) -> Option<String> {
-    let computed = match algorithm.to_ascii_uppercase().as_str() {
-        "SHA-1" => digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, bytes),
-        "SHA-256" => digest::digest(&digest::SHA256, bytes),
-        "SHA-384" => digest::digest(&digest::SHA384, bytes),
-        "SHA-512" => digest::digest(&digest::SHA512, bytes),
-        _ => return None,
-    };
-    Some(
-        computed
-            .as_ref()
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect(),
-    )
+    let algorithm = digest_algorithm(algorithm)?;
+    Some(hex_encode(digest::digest(algorithm, bytes).as_ref()))
+}
+
+/// Discards a streamed write's staged bytes on any rejection path in
+/// `finish_write` (hash mismatch, quota exceeded): for `File` staging,
+/// deletes the temp file (it was never renamed to `final_path`, so the
+/// registry never observes it); for `InMemory` staging, there is nothing
+/// to clean up beyond dropping the buffer, which happens automatically.
+fn discard_staging(staging: &PendingWriteStaging) {
+    if let PendingWriteStaging::File { temp_path, .. } = staging {
+        let _ = std::fs::remove_file(temp_path);
+    }
 }
 
 #[cfg(test)]
@@ -2978,6 +3257,136 @@ mod tests {
         assert!(
             leftover_temp_files.is_empty(),
             "expected no leftover .tmp files, found {leftover_temp_files:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn streamed_write_assembles_bytes_correctly_across_many_single_byte_chunks() {
+        let store = store();
+        // One byte per `WriteChunk`, deliberately smaller than the
+        // `#[cfg(test)]` `verify_and_store` wrapper's own `TEST_CHUNK_SIZE`,
+        // to directly exercise `begin_write`/`write_chunk`/`finish_write`
+        // with the most fragmented chunking this protocol allows, rather
+        // than going through that wrapper.
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+        let writer = origin("https://writer.example");
+
+        let session_id = WriteSessionId(1);
+        store.begin_write(session_id, h.clone(), writer.clone(), bytes.len() as u64);
+        for byte in &bytes {
+            store.write_chunk(session_id, vec![*byte]);
+        }
+        assert!(matches!(
+            store.finish_write(session_id, "application/octet-stream".to_owned(), None),
+            VerifyAndStoreOutcome::Success
+        ));
+
+        match store.complete_a_read_request(&h, &writer) {
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(*found, bytes),
+            _ => panic!("expected the assembled bytes to read back exactly as written"),
+        }
+    }
+
+    #[test]
+    fn finish_write_rejects_with_hash_mismatch_when_received_bytes_is_short_of_declared_total() {
+        let store = store();
+        let bytes = b"declared-more-than-actually-sent".to_vec();
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+        let writer = origin("https://writer.example");
+
+        let session_id = WriteSessionId(1);
+        // Declares the full length, but only ever sends a prefix of it --
+        // `finish_write` must not treat this as a truncated-but-otherwise-
+        // valid write; a hash can only ever be computed over the complete,
+        // exact byte sequence.
+        store.begin_write(session_id, h.clone(), writer.clone(), bytes.len() as u64);
+        store.write_chunk(session_id, bytes[..bytes.len() - 5].to_vec());
+        assert!(matches!(
+            store.finish_write(session_id, "text/plain".to_owned(), None),
+            VerifyAndStoreOutcome::HashMismatch
+        ));
+
+        // And the incomplete write must not have been published as a
+        // readable entry either.
+        assert!(matches!(
+            store.complete_a_read_request(&h, &writer),
+            CosReadOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn begin_write_declines_to_create_a_session_once_the_write_budget_is_exhausted() {
+        let store = store();
+        let o = origin("https://writer.example.com");
+        for _ in 0..(WRITE_BUDGET_CAPACITY as usize) {
+            store.consume_write_token(&o);
+        }
+
+        let bytes = b"over-write-budget-streamed".to_vec();
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+
+        let session_id = WriteSessionId(1);
+        store.begin_write(session_id, h, o, bytes.len() as u64);
+        // No session was ever created (the rate limit was already
+        // exhausted at `begin_write` time), so a `WriteChunk` for it has
+        // nowhere to go and is silently dropped -- `finish_write` finding
+        // no tracked session is the only way this outcome is produced.
+        store.write_chunk(session_id, bytes);
+        assert!(matches!(
+            store.finish_write(session_id, "text/plain".to_owned(), None),
+            VerifyAndStoreOutcome::RateLimited
+        ));
+    }
+
+    #[test]
+    fn a_write_session_that_never_finishes_leaves_no_temp_file_after_the_next_store_load() {
+        let dir = std::env::temp_dir().join(format!("servo-cos-stale-session-test-{}", uuid_like_suffix()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let bytes = b"never-finished".to_vec();
+        let hex = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &hex);
+        let writer = origin("https://writer.example");
+
+        let session_id = WriteSessionId(1);
+        {
+            let store = CrossOriginStorageStore::new(Some(dir.clone()));
+            // Begins (and partially streams) a write, then drops the
+            // store without ever calling `finish_write` -- simulating the
+            // browser exiting or crashing mid-write.
+            store.begin_write(session_id, h, writer, bytes.len() as u64);
+            store.write_chunk(session_id, bytes);
+        }
+
+        let leftover_temp_files: Vec<_> = std::fs::read_dir(dir.join(ENTRY_BYTES_DIR))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+            .collect();
+        assert!(
+            !leftover_temp_files.is_empty(),
+            "the abandoned session's temp file should still exist right after the crash, \
+             before any fresh store has had a chance to clean it up"
+        );
+
+        // Loading a fresh store from the same config_dir -- what happens
+        // on the next browser launch -- must clean up the orphaned temp
+        // file left behind by the session that never finished.
+        let _reloaded = CrossOriginStorageStore::new(Some(dir.clone()));
+        let leftover_temp_files: Vec<_> = std::fs::read_dir(dir.join(ENTRY_BYTES_DIR))
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("tmp"))
+            .collect();
+        assert!(
+            leftover_temp_files.is_empty(),
+            "expected no leftover .tmp files after a fresh store load, found {leftover_temp_files:?}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

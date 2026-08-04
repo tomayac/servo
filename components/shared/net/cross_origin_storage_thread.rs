@@ -179,10 +179,35 @@ pub enum VerifyAndStoreOutcome {
     QuotaExceeded { quota_bytes: u64, requested_bytes: u64 },
 }
 
+/// Identifies one in-progress streamed `verify and store` across its
+/// `BeginWrite`/`WriteChunk`/`FinishWrite` messages; see `CosThreadMsg`'s
+/// doc comment for the full protocol. A random `u64`, generated
+/// script-side, is enough to make collisions between sessions in flight
+/// at the same time (possibly from different origins/tabs, all talking
+/// to the same resource thread) practically impossible.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub struct WriteSessionId(pub u64);
+
 /// Messages understood by the Cross-Origin Storage service living in the
 /// resource thread. Reached via
 /// `CoreResourceMsg::ToCrossOriginStorage`, mirroring
 /// `CoreResourceMsg::ToFileManager(FileManagerThreadMsg)`.
+///
+/// `verify and store` is streamed across three message kinds
+/// (`BeginWrite`/`WriteChunk`/`FinishWrite`) rather than sent as a single
+/// message carrying the whole write's bytes, so the resource thread
+/// never has to hold an entire large entry (this feature targets
+/// potentially multi-hundred-MiB sharded AI model weights) in memory at
+/// once -- see `net::cross_origin_storage_thread`'s doc comment on
+/// per-session streaming for the full mechanism. The script-side sender
+/// still assembles the complete write in memory first (unavoidable:
+/// `FileSystemWritableFileStream` supports `seek()`/`truncate()`
+/// random-access edits, and a hash can only be computed over the
+/// *final* byte sequence), and sends it in chunks only once it is
+/// complete and `close()` is called -- this narrows the memory win to
+/// the resource thread specifically, not the whole pipeline, but that
+/// thread is shared across every tab and origin using Cross-Origin
+/// Storage, so it is the more valuable place to economize.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CosThreadMsg {
     /// `complete a read request`. Answered via a `GenericCallback` so the
@@ -202,13 +227,31 @@ pub enum CosThreadMsg {
     /// a later request for the same hash notices it is stale; see
     /// `CrossOriginStorageStore::abandon_pending_write`.
     AbandonPendingWrite(CosHash),
-    /// `verify and store`. Same `GenericCallback` reasoning as `Read`
-    /// above.
-    VerifyAndStore(
-        CosHash,
-        Vec<u8>,
+    /// Begins a streamed `verify and store`
+    /// (<https://wicg.github.io/cross-origin-storage/#verify-and-store>):
+    /// declares the session's target hash, requesting origin, and the
+    /// exact total number of bytes that will follow, before any of them
+    /// arrive. Must eventually be followed by exactly enough
+    /// `WriteChunk` messages to add up to `total_bytes`, then exactly
+    /// one `FinishWrite`, all for the same `WriteSessionId`. No response
+    /// is expected for this message specifically -- see
+    /// `net::cross_origin_storage_thread`'s doc comment for what happens
+    /// if the write-probe rate limit is already exhausted when this
+    /// arrives.
+    BeginWrite(WriteSessionId, CosHash, ImmutableOrigin, u64),
+    /// One chunk of a streamed write previously begun by `BeginWrite`.
+    /// Messages sent on the same underlying channel arrive in the order
+    /// they were sent, so a session's chunks always arrive in the order
+    /// they were written -- there is no separate sequence number.
+    WriteChunk(WriteSessionId, Vec<u8>),
+    /// Finalizes a streamed write: compares the now-complete digest of
+    /// every byte received for this session against the hash declared
+    /// in its `BeginWrite`, and on success, atomically publishes the
+    /// session's staged bytes as that hash's real entry. Same
+    /// `GenericCallback` reasoning as `Read` above.
+    FinishWrite(
+        WriteSessionId,
         String,
-        ImmutableOrigin,
         Option<RequestedOrigins>,
         GenericCallback<VerifyAndStoreOutcome>,
     ),
