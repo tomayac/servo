@@ -42,10 +42,17 @@ jobs:
             --title "${{ inputs.release_tag }}" \
             --notes "Cross-Origin Storage test build, based on ${{ github.repository }}@${{ github.sha }}" \
             --repo "${{ github.repository }}")
+          # A draft release has no real git tag ref yet (that's only
+          # created on publish), so /releases/tags/<the real tag> 404s
+          # for it -- gh release create's own returned URL instead ends
+          # in an internal placeholder identifier (e.g.
+          # "untagged-xxxx...") that this same lookup endpoint DOES
+          # resolve, which is what we actually need here.
+          TEMP_TAG=$(basename "$RELEASE_URL")
           RELEASE_ID=$( \
             gh api -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2026-03-10" \
-            "/repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }}" \
+            "/repos/${{ github.repository }}/releases/tags/${TEMP_TAG}" \
             --jq '.id' \
           )
           echo "release-id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
