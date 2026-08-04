@@ -371,23 +371,6 @@ impl Node {
         }
     }
 
-    /// Clear style and layout data on this [`Node`] and all descendants. This is used to clean
-    /// up the data when a [`Node`] becomes detached from the flat tree. Note that this
-    /// operates on both DOM and flat tree descendants.
-    pub(crate) fn remove_style_and_layout_data_from_subtree(&self, no_gc: &NoGC) {
-        for node in self.traverse_preorder_non_rooting(no_gc, ShadowIncluding::Yes) {
-            node.clean_up_style_and_layout_data();
-        }
-    }
-
-    fn clean_up_style_and_layout_data(&self) {
-        self.layout_data.borrow_mut().take();
-        if let Some(element) = self.downcast::<Element>() {
-            element.clean_up_style_data();
-        }
-        self.set_flag(NodeFlags::OVERLAPS_DOCUMENT_SELECTION, false);
-    }
-
     /// Clean up flags and runs steps 11-14 of remove a node.
     /// <https://dom.spec.whatwg.org/#concept-node-remove>
     pub(crate) fn complete_remove_subtree(
@@ -424,9 +407,10 @@ impl Node {
 
         // Since both the initial traversal in light dom and the inner traversal
         // in shadow DOM share the same code, we define a closure to prevent omissions.
+        let document = root.owner_doc();
         let cleanup_node = |cx: &mut JSContext, node: &Node| {
-            node.owner_doc().cancel_animations_for_node(node);
-            node.clean_up_style_and_layout_data();
+            document.cancel_animations_for_node(node);
+            document.clean_up_style_and_layout_data_for_node(node);
 
             // Step 11 & 14.1. Run the removing steps.
             // This needs to be in its own loop, because unbind_from_tree may
@@ -486,9 +470,10 @@ impl Node {
             .union(NodeFlags::HANDLED_SNAPSHOT)
             .union(NodeFlags::OVERLAPS_DOCUMENT_SELECTION);
 
+        let document = root.owner_document();
         for node in root.traverse_preorder(ShadowIncluding::No) {
             node.set_flag(RESET_FLAGS | NodeFlags::IS_IN_SHADOW_TREE, false);
-            node.clean_up_style_and_layout_data();
+            document.clean_up_style_and_layout_data_for_node(&node);
 
             // Unregister the `id` and `name` attributes for this node. Note that they
             // will be re-registered when added to the tree again.
@@ -513,7 +498,7 @@ impl Node {
                     .traverse_preorder(ShadowIncluding::Yes)
                 {
                     node.set_flag(RESET_FLAGS, false);
-                    node.clean_up_style_and_layout_data();
+                    document.clean_up_style_and_layout_data_for_node(&node);
                 }
             }
         }
@@ -567,7 +552,7 @@ impl Node {
 
     fn move_child(&self, cx: &mut JSContext, child: &Node) {
         assert!(child.parent_node.get().as_deref() == Some(self));
-        self.dirty(NodeDamage::ContentOrHeritage);
+        self.dirty(cx.no_gc(), NodeDamage::ContentOrHeritage);
         self.note_dirty_descendants(cx.no_gc());
         self.add_pending_accessibility_damage(AccessibilityDamage::Children);
 
@@ -893,7 +878,7 @@ impl Node {
         self.get_flag(NodeFlags::HAS_DIRTY_DESCENDANTS)
     }
 
-    pub(crate) fn rev_version(&self) {
+    pub(crate) fn rev_version(&self, no_gc: &NoGC) {
         // The new version counter is 1 plus the max of the node's current version counter,
         // its descendants version, and the document's version. Normally, this will just be
         // the document's version, but we do have to deal with the case where the node has moved
@@ -904,20 +889,18 @@ impl Node {
             doc.inclusive_descendants_version(),
         ) + 1;
 
-        // This `while` loop is equivalent to iterating over the non-shadow-inclusive ancestors
-        // without creating intermediate rooted DOM objects.
-        let mut node = &MutNullableDom::new(Some(self));
-        while let Some(p) = node.if_is_some(|p| {
-            p.inclusive_descendants_version.set(version);
-            &p.parent_node
-        }) {
-            node = p
+        for node in self.inclusive_ancestors_unrooted(no_gc, ShadowIncluding::No) {
+            node.inclusive_descendants_version.set(version);
         }
         doc.inclusive_descendants_version.set(version);
     }
 
-    pub(crate) fn dirty(&self, damage: NodeDamage) {
-        self.rev_version();
+    pub(crate) fn clear_layout_data(&self) {
+        self.layout_data.take();
+    }
+
+    pub(crate) fn dirty(&self, no_gc: &NoGC, damage: NodeDamage) {
+        self.rev_version(no_gc);
         if !self.is_connected() {
             return;
         }
@@ -934,7 +917,7 @@ impl Node {
                 self.parent_node
                     .get()
                     .unwrap()
-                    .dirty(NodeDamage::ContentOrHeritage);
+                    .dirty(no_gc, NodeDamage::ContentOrHeritage);
 
                 if damage == NodeDamage::Other {
                     self.add_pending_accessibility_damage(AccessibilityDamage::Text);
