@@ -65,5 +65,5 @@ jobs:
         run: |
           gh pr create \
             --title "Refresh the bundled Public Hash List snapshot" \
-            --body "Automated weekly refresh of \`components/default-resources/resources/public_hash_list.bin\` from https://github.com/tomayac/public-hash-list." \
+            --body "Automated weekly refresh of \`components/default-resources/resources/public_hash_list.bin\` from https://github.com/WICG/cross-origin-storage/tree/main/public-hash-list/implementation/data." \
             --head "$UPDATE_BRANCH"

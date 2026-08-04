@@ -144,8 +144,8 @@ pub enum Resource {
     /// <https://wicg.github.io/cross-origin-storage/#phl>): a k-anonymity
     /// allowlist of SHA-256 digests unconditionally eligible for
     /// cross-origin availability disclosure, from
-    /// <https://github.com/tomayac/public-hash-list>. Stored as sorted,
-    /// packed 32-byte digests with no delimiters (see
+    /// <https://github.com/WICG/cross-origin-storage/tree/main/public-hash-list/implementation/data>.
+    /// Stored as sorted, packed 32-byte digests with no delimiters (see
     /// `net_traits::public_hash_list`). It can be empty, in which case no
     /// wildcard-scoped Cross-Origin Storage entry is ever disclosed.
     PublicHashList,

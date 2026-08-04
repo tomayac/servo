@@ -32,9 +32,9 @@
 //! `Wildcard`-scoped (`origins: '*'`) disclosure uses the real Public
 //! Hash List (PHL): `net_traits::public_hash_list::is_hex_digest_on_public_hash_list`,
 //! a bundled, sorted-for-binary-search snapshot of
-//! <https://github.com/tomayac/public-hash-list> (refreshed by
-//! `./mach update-public-hash-list`, also run weekly in CI -- see that
-//! module's doc comment). A hash not on the list fails closed: only a
+//! <https://github.com/WICG/cross-origin-storage/tree/main/public-hash-list/implementation/data>
+//! (refreshed by `./mach update-public-hash-list`, also run weekly in CI --
+//! see that module's doc comment). A hash not on the list fails closed: only a
 //! `Wildcard`-scoped entry whose hash is confirmed present on the PHL is
 //! disclosed to non-storing origins; every other `Wildcard`-scoped entry
 //! stays hidden from them.

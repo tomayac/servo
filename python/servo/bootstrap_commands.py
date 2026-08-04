@@ -144,11 +144,18 @@ class MachCommands(CommandBase):
         category="bootstrap",
     )
     def update_public_hash_list(self, force: bool = False) -> None:
-        # Third-party, independently maintained snapshot of the WICG
-        # Cross-Origin Storage Public Hash List (PHL); see
-        # <https://wicg.github.io/cross-origin-storage/#phl> and
-        # <https://github.com/tomayac/public-hash-list>.
-        list_url = "https://raw.githubusercontent.com/tomayac/public-hash-list/main/data/public-hash-list.dat"
+        # Snapshot of the WICG Cross-Origin Storage Public Hash List (PHL);
+        # see <https://wicg.github.io/cross-origin-storage/#phl>. Generated
+        # and published directly in the spec repo, at
+        # <https://github.com/WICG/cross-origin-storage/tree/main/public-hash-list/implementation>,
+        # and tracked there via Git LFS -- `raw.githubusercontent.com` only
+        # serves the LFS pointer text for this file, not its actual
+        # content, so this has to go through `media.githubusercontent.com`'s
+        # LFS media endpoint instead.
+        list_url = (
+            "https://media.githubusercontent.com/media/WICG/cross-origin-storage"
+            "/main/public-hash-list/implementation/data/public-hash-list.dat"
+        )
         dst_filename = path.join(
             self.context.topdir,
             "components",

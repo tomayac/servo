@@ -11,14 +11,16 @@
 //! this codebase.
 //!
 //! The bundled snapshot comes from
-//! <https://github.com/tomayac/public-hash-list>, an independent,
-//! third-party generated list (not affiliated with the WICG proposal
-//! itself); refresh it with `./mach update-public-hash-list` (also run
-//! automatically on a weekly schedule -- see
-//! `.github/workflows/update-public-hash-list.yml` -- since, per the
-//! spec text above, this is meant to be a rolling release, not a
-//! one-time snapshot). The list is bundled as sorted, packed 32-byte
-//! SHA-256 digests with no delimiters
+//! <https://github.com/WICG/cross-origin-storage/tree/main/public-hash-list/implementation>,
+//! generated and published directly in the spec repo itself, and tracked
+//! there via Git LFS (see `update_public_hash_list` in
+//! `python/servo/bootstrap_commands.py` for why that means fetching it
+//! isn't as simple as a plain `raw.githubusercontent.com` URL); refresh it
+//! with `./mach update-public-hash-list` (also run automatically on a
+//! weekly schedule -- see `.github/workflows/update-public-hash-list.yml`
+//! -- since, per the spec text above, this is meant to be a rolling
+//! release, not a one-time snapshot). The list is bundled as sorted,
+//! packed 32-byte SHA-256 digests with no delimiters
 //! (`components/default-resources/resources/public_hash_list.bin`)
 //! rather than the upstream `.dat` file's hex-with-comments text format,
 //! purely to keep the compiled-in resource compact; sortedness enables
