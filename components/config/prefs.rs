@@ -437,7 +437,10 @@ impl Preferences {
             dom_composition_event_enabled: false,
             dom_cookiestore_enabled: false,
             dom_credential_management_enabled: false,
-            dom_cross_origin_storage_enabled: false,
+            // Defaulted on for this cross-origin-storage demo/test branch
+            // only, so a plain downloaded build works with zero setup for
+            // testers; revert to `false` before any upstream PR.
+            dom_cross_origin_storage_enabled: true,
             dom_crypto_subtle_enabled: true,
             dom_document_dblclick_dist: 1,
             dom_document_dblclick_timeout: 300,
