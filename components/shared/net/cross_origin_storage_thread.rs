@@ -12,6 +12,8 @@
 //! crate for the same reason: both `script` and `net` need these types,
 //! and `net` cannot depend on `script`.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use servo_base::generic_channel::GenericCallback;
 use servo_url::ImmutableOrigin;
@@ -135,9 +137,21 @@ pub const MAX_ORIGINS_LIST_LENGTH: usize = 100;
 /// The result of `complete a read request`
 /// (<https://wicg.github.io/cross-origin-storage/#complete-a-read-request>),
 /// sent back over IPC.
+///
+/// `Found.bytes` is an `Arc<Vec<u8>>`, not a plain `Vec<u8>`: in
+/// single-process mode (`GenericCallback`'s in-process variant), this
+/// crosses the resource-thread-to-script-thread boundary as a cheap
+/// reference-counted handle rather than a byte-for-byte copy, which
+/// matters for this feature's large (potentially multi-hundred-MiB)
+/// payloads. In multiprocess mode, `Arc<Vec<u8>>` serializes the same as
+/// `Vec<u8>` would (crossing a real OS process boundary always requires
+/// copying the bytes somewhere, `Arc` or not), so this is never worse,
+/// only sometimes better. Either way, an owned `Vec<u8>` still has to be
+/// materialized once a `File`/`Blob` is actually constructed from it --
+/// see `script::dom::crossoriginstorage::registry`'s `EntryBytes`.
 #[derive(Debug, Deserialize, Serialize)]
 pub enum CosReadOutcome {
-    Found { bytes: Vec<u8>, type_string: String },
+    Found { bytes: Arc<Vec<u8>>, type_string: String },
     NotFound,
     /// The entry exists but a write is (notionally) still in progress.
     PendingWrite,

@@ -262,8 +262,15 @@ struct StoredEntryBytes {
     /// comment. Populated from its own per-entry file, either right after a
     /// successful `verify_and_store` (in memory only, no re-read needed)
     /// or by `CrossOriginStorageStore::new()` on startup.
+    ///
+    /// `Arc<Vec<u8>>`, not a plain `Vec<u8>`, so `complete_a_read_request`
+    /// can hand out a reference-counted clone of this same buffer instead
+    /// of a fresh byte-for-byte copy on every read; see
+    /// `net_traits::cross_origin_storage_thread::CosReadOutcome::Found`'s
+    /// doc comment for the rest of that path, all the way to where a
+    /// `File`/`Blob` finally has to materialize an owned `Vec<u8>`.
     #[serde(skip)]
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     type_string: String,
 }
 
@@ -578,7 +585,7 @@ impl CrossOriginStorageStore {
                 match std::fs::read(entry_bytes_path(dir, &key)) {
                     Ok(bytes) => {
                         if let Some(stored) = entry.bytes.as_mut() {
-                            stored.bytes = bytes;
+                            stored.bytes = Arc::new(bytes);
                         }
                     },
                     Err(err) => {
@@ -800,7 +807,13 @@ impl CrossOriginStorageStore {
         // available afterward; see that field's doc comment.
         let outcome = match &entry.bytes {
             Some(bytes) => CosReadOutcome::Found {
-                bytes: bytes.bytes.clone(),
+                // A cheap refcount bump, not a byte-for-byte copy: the
+                // registry keeps its own `Arc` (this clone is a second,
+                // independent handle to the same buffer), and the
+                // eventual owned `Vec<u8>` a `File`/`Blob` needs is only
+                // materialized once, on the far side of this response;
+                // see `StoredEntryBytes::bytes`'s doc comment.
+                bytes: Arc::clone(&bytes.bytes),
                 type_string: bytes.type_string.clone(),
             },
             None => CosReadOutcome::NotFound,
@@ -1037,7 +1050,7 @@ impl CrossOriginStorageStore {
         // since a first write was never in `recency_index` to begin with.
         let is_first_write = entry.bytes.is_none();
         let old_last_read_unix_secs = entry.last_read_unix_secs;
-        entry.bytes = Some(StoredEntryBytes { bytes, type_string });
+        entry.bytes = Some(StoredEntryBytes { bytes: Arc::new(bytes), type_string });
         entry.state = CosEntryState::Written;
         entry.last_read_unix_secs = unix_now_secs();
         let new_last_read_unix_secs = entry.last_read_unix_secs;
@@ -1527,7 +1540,7 @@ mod tests {
     ) -> CosEntry {
         CosEntry {
             bytes: Some(StoredEntryBytes {
-                bytes: vec![0u8; size],
+                bytes: Arc::new(vec![0u8; size]),
                 type_string: String::new(),
             }),
             state: CosEntryState::Written,
@@ -1563,7 +1576,7 @@ mod tests {
         ));
 
         match store.complete_a_read_request(&h, &writer) {
-            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(*found, bytes),
             _ => panic!("expected the storing origin to read its own write back"),
         }
     }
@@ -1616,7 +1629,7 @@ mod tests {
         ));
 
         match store.complete_a_read_request(&h, &reader) {
-            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(*found, bytes),
             _ => panic!("expected a different-origin, same-registrable-domain reader to succeed"),
         }
     }
@@ -1881,7 +1894,7 @@ mod tests {
             key.clone(),
             CosEntry {
                 bytes: Some(StoredEntryBytes {
-                    bytes,
+                    bytes: Arc::new(bytes),
                     type_string: "text/plain".to_owned(),
                 }),
                 state: CosEntryState::Written,
@@ -2058,7 +2071,7 @@ mod tests {
     fn should_grease_never_greases_entries_at_or_above_the_size_cap() {
         let entry = CosEntry {
             bytes: Some(StoredEntryBytes {
-                bytes: vec![0u8; GREASE_MAX_SIZE_BYTES],
+                bytes: Arc::new(vec![0u8; GREASE_MAX_SIZE_BYTES]),
                 type_string: "application/octet-stream".to_owned(),
             }),
             state: CosEntryState::Written,
@@ -2076,7 +2089,7 @@ mod tests {
     fn should_grease_sometimes_greases_entries_under_the_size_cap() {
         let entry = CosEntry {
             bytes: Some(StoredEntryBytes {
-                bytes: vec![0u8; 10],
+                bytes: Arc::new(vec![0u8; 10]),
                 type_string: "text/plain".to_owned(),
             }),
             state: CosEntryState::Written,
@@ -2303,7 +2316,7 @@ mod tests {
         ));
 
         match store.complete_a_read_request(&h, &writer) {
-            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(*found, bytes),
             other => panic!("expected the retried write to succeed, got {other:?}"),
         }
     }
@@ -2346,7 +2359,7 @@ mod tests {
         store.abandon_pending_write(&h);
 
         match store.complete_a_read_request(&h, &writer) {
-            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(*found, bytes),
             other => panic!("expected the written entry to survive, got {other:?}"),
         }
     }
@@ -2388,7 +2401,7 @@ mod tests {
         // between -- this is the "survives a restart" property.
         let reloaded = CrossOriginStorageStore::new(Some(dir.clone()));
         match reloaded.complete_a_read_request(&h, &writer) {
-            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(found, bytes),
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(*found, bytes),
             _ => panic!("expected the reloaded store to have the persisted entry"),
         }
 

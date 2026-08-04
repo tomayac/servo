@@ -35,6 +35,7 @@
 //! long blocking script-thread call freezes scrolling along with it.
 
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 pub(crate) use net_traits::cross_origin_storage_thread::{MAX_ORIGINS_LIST_LENGTH, RequestedOrigins};
@@ -57,9 +58,13 @@ use crate::dom::promise::Promise;
 use crate::task_source::SendableTaskSource;
 
 /// A written [COS entry](https://wicg.github.io/cross-origin-storage/#cos-entry)'s
-/// bytes, as received over IPC from the resource thread.
+/// bytes, as received over IPC from the resource thread. `bytes` stays
+/// an `Arc<Vec<u8>>` (matching `CosReadOutcome::Found`'s wire type, see
+/// its doc comment) all the way until a `File`/`Blob` actually needs to
+/// be constructed from it, so a handle that is obtained but never read
+/// via `getFile()` never pays for a copy at all.
 pub(crate) struct EntryBytes {
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) bytes: Arc<Vec<u8>>,
     pub(crate) type_string: String,
 }
 
@@ -189,7 +194,14 @@ impl CosReadForFileResponseHandler {
                 let global = GlobalScope::from_current_realm(&mut realm);
                 match outcome {
                     ReadOutcome::Found(entry) => {
-                        let blob_impl = BlobImpl::new_from_bytes(entry.bytes, entry.type_string);
+                        // `Blob`'s own storage is a plain `Vec<u8>`, so
+                        // this is the one point this data's `Arc` sharing
+                        // (see `EntryBytes`'s doc comment) can't avoid an
+                        // owned copy -- but it's a single copy either
+                        // way, now paid on the script thread instead of
+                        // the (shared, single) resource thread.
+                        let blob_impl =
+                            BlobImpl::new_from_bytes((*entry.bytes).clone(), entry.type_string);
                         let file = File::new(
                             cx,
                             &global,

@@ -154,8 +154,17 @@ impl FileSystemFileHandleMethods<crate::DomTypeHolder> for FileSystemFileHandle 
 
         match &self.backing {
             Backing::Read(entry) => {
+                // `Blob`'s own storage is a plain `Vec<u8>`, so this is
+                // the one point this data's `Arc` sharing (see
+                // `EntryBytes`'s doc comment) can't avoid an owned copy
+                // -- `(*entry.bytes).clone()`, not `entry.bytes.clone()`,
+                // since the latter would just clone the `Arc` handle
+                // (cheap, shares the same buffer) rather than the bytes
+                // a `Blob` actually needs to own independently. A handle
+                // this is called on repeatedly still pays this cost each
+                // time, same as before.
                 let blob_impl =
-                    BlobImpl::new_from_bytes(entry.bytes.clone(), entry.type_string.clone());
+                    BlobImpl::new_from_bytes((*entry.bytes).clone(), entry.type_string.clone());
                 let name = DOMString::from(self.file_system_handle.name().to_string());
                 let file = File::new(
                     realm,

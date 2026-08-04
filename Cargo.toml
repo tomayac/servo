@@ -220,7 +220,7 @@ sea-query = { version = "1.0.1", default-features = false, features = ["backend-
 sea-query-rusqlite = "0.8.0"
 selectors = { git = "https://github.com/servo/stylo", rev = "2d289c14fdf46952d52cabce63b1f0dc55b2ccde" }
 seq-macro = "0.3.6"
-serde = "1.0.228"
+serde = { version = "1.0.228", features = ["rc"] }
 serde_bytes = "0.11"
 serde_core = "1.0.226"
 serde_json = "1.0"
