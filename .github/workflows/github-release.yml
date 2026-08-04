@@ -1,0 +1,147 @@
+name: GitHub Release
+
+# A trimmed-down variant of release.yml for building and publishing test
+# binaries from a personal fork, without any of upstream servo/servo's own
+# release infrastructure: no cross-repo nightly-builds target, no S3 upload
+# (release.yml's artifact-upload step unconditionally tries that first, using
+# a servo-project-only S3_UPLOAD_CREDENTIALS secret a fork won't have, so it
+# would fail before ever reaching the "attach to the GitHub Release" step),
+# and no Android/OpenHarmony builds (their release.yml jobs use `secrets:
+# inherit` for signing keys a fork won't have either). Builds macOS
+# (x86_64 + arm64), Linux (x86_64 + arm64), and Windows via the same reusable
+# per-platform workflows release.yml itself uses, and uploads each platform's
+# binary straight to a draft GitHub Release on this repo using the default
+# GITHUB_TOKEN -- left as a draft, matching release.yml's own regular-release
+# behavior, so nothing is publicly visible until manually published.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        required: true
+        type: string
+        description: "The tag to create for this release"
+
+env:
+  RUST_BACKTRACE: 1
+  SHELL: /bin/bash
+
+jobs:
+  create-draft-release:
+    name: Create Draft GH Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - id: create-release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          RELEASE_URL=$(gh release create "${{ inputs.release_tag }}" \
+            --draft \
+            --title "${{ inputs.release_tag }}" \
+            --notes "Cross-Origin Storage test build, based on ${{ github.repository }}@${{ github.sha }}" \
+            --repo "${{ github.repository }}")
+          RELEASE_ID=$( \
+            gh api -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "/repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }}" \
+            --jq '.id' \
+          )
+          echo "release-id=${RELEASE_ID}" >> "${GITHUB_OUTPUT}"
+          echo "Created draft release: ${RELEASE_URL}"
+    outputs:
+      release-id: ${{ steps.create-release.outputs.release-id }}
+
+  build-mac:
+    name: Build production release (macOS)
+    uses: ./.github/workflows/mac.yml
+    with:
+      profile: "production"
+      force-github-hosted-runner: true
+
+  build-mac-arm64:
+    name: Build production release (macOS Arm64)
+    uses: ./.github/workflows/mac-arm64.yml
+    with:
+      profile: "production"
+      force-github-hosted-runner: true
+
+  build-linux:
+    name: Build production release (Linux)
+    uses: ./.github/workflows/linux.yml
+    with:
+      profile: "production"
+      force-github-hosted-runner: true
+
+  build-linux-arm64:
+    name: Build production release (Linux Arm64)
+    uses: ./.github/workflows/linux-arm64.yml
+    with:
+      profile: "production"
+      force-github-hosted-runner: true
+
+  build-win:
+    name: Build production release (Windows)
+    uses: ./.github/workflows/windows.yml
+    with:
+      profile: "production"
+      upload_zip: true
+      force-github-hosted-runner: true
+
+  upload-artifacts:
+    name: Upload ${{ matrix.artifact_platform }} artifacts to the release
+    # Runs per-platform regardless of whether other platforms failed
+    # (fail-fast: false below), so one platform's build failure doesn't
+    # stop the others from still being attached to the release.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    needs:
+      - create-draft-release
+      - build-mac
+      - build-mac-arm64
+      - build-linux
+      - build-linux-arm64
+      - build-win
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - artifact_ids: ${{ needs.build-mac.outputs.artifact_ids }}
+            artifact_platform: mac
+          - artifact_ids: ${{ needs.build-mac-arm64.outputs.artifact_ids }}
+            artifact_platform: mac-arm64
+          - artifact_ids: ${{ needs.build-linux.outputs.artifact_ids }}
+            artifact_platform: linux
+          - artifact_ids: ${{ needs.build-linux-arm64.outputs.artifact_ids }}
+            artifact_platform: linux-arm64
+          - artifact_ids: ${{ needs.build-win.outputs.artifact_ids }}
+            artifact_platform: windows-msvc
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check whether this platform actually produced artifacts
+        id: check
+        run: |
+          if [[ -z "${{ matrix.artifact_ids }}" ]]; then
+            echo "No artifacts for ${{ matrix.artifact_platform }} -- its build likely failed; skipping upload."
+            echo "has-artifacts=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "has-artifacts=true" >> "${GITHUB_OUTPUT}"
+          fi
+      - uses: actions/download-artifact@v8
+        if: ${{ steps.check.outputs.has-artifacts == 'true' }}
+        with:
+          artifact-ids: ${{ matrix.artifact_ids }}
+          merge-multiple: true
+          path: release-artifacts
+      - name: Prefix filenames with platform and upload to the release
+        if: ${{ steps.check.outputs.has-artifacts == 'true' }}
+        run: |
+          cd release-artifacts
+          for f in ./*; do
+            mv -- "$f" "./${{ matrix.artifact_platform }}-$(basename "$f")"
+          done
+          gh release upload "${{ inputs.release_tag }}" ./* --repo "${{ github.repository }}"
