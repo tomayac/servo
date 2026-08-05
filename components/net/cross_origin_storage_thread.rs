@@ -117,21 +117,39 @@
 //! loads the registry by scanning this directory for `.json` files.
 //!
 //! A `Pending` entry (created by `complete a create request`, before the
-//! matching `close()`/`verify_and_store` ever runs) can be abandoned:
-//! explicitly, via `FileSystemWritableFileStream.abort()`
-//! (`CosThreadMsg::AbandonPendingWrite`, handled by
-//! `abandon_pending_write` below, removes it immediately), or silently, by
-//! a page navigating away or a stream simply never being closed or
-//! aborted at all (no signal reaches this thread in that case). The
-//! second kind is handled by `PENDING_ENTRY_STALE_AFTER_SECS`: a `Pending`
-//! entry older than that is treated as absent by
-//! `complete_a_read_request` (so a reader is not permanently stuck seeing
-//! `PendingWrite`) and is replaced by a fresh one by
-//! `complete_a_create_request` (so a new write attempt for the same hash
-//! is not permanently blocked either). A `Pending` entry that is still
-//! within the staleness window is left alone by both -- this is also the
-//! ordinary, expected shape of two genuinely concurrent writes for the
-//! same hash racing each other, not just the abandoned case.
+//! matching `close()`/`verify_and_store` ever runs) can stop being
+//! `Pending` -- reach `Written`, or be reclaimed -- in one of four ways:
+//!
+//! 1. **A successful `close()`**: handled by `finish_write`'s success
+//!    path, sets `state` to `Written`.
+//! 2. **A failed `close()`** (a hash mismatch, or any other rejection
+//!    `finish_write` can produce): per
+//!    <https://wicg.github.io/cross-origin-storage/#verify-and-store>,
+//!    the entry is removed immediately, via
+//!    `decrement_pending_writer_and_maybe_remove` -- but *only* once no
+//!    other writer is still outstanding for the same hash
+//!    (`CosEntry::pending_writer_count` reaches `0`), so this can never
+//!    remove an entry a genuinely concurrent sibling write (see point 4
+//!    below) may still successfully complete.
+//! 3. **An explicit `FileSystemWritableFileStream.abort()`**
+//!    (`CosThreadMsg::AbandonPendingWrite`, handled by
+//!    `abandon_pending_write` below): the same `pending_writer_count`-
+//!    gated removal as point 2, for the same reason.
+//! 4. **Silent abandonment**: a page navigating away, or a stream simply
+//!    never being closed or aborted at all (no signal reaches this
+//!    thread in that case -- this is also, indistinguishably, the
+//!    ordinary, expected shape of a write that's still genuinely in
+//!    flight, possibly a concurrent one from another origin racing this
+//!    hash). Handled by `PENDING_ENTRY_STALE_AFTER_SECS`, a wall-clock
+//!    fallback independent of `pending_writer_count` (since an
+//!    abandoned handle never sends any message this thread could use to
+//!    decrement it): a `Pending` entry older than that is treated as
+//!    absent by `complete_a_read_request` (so a reader is not
+//!    permanently stuck seeing `PendingWrite`) and is replaced by a
+//!    fresh one by `complete_a_create_request` (so a new write attempt
+//!    for the same hash is not permanently blocked either). A `Pending`
+//!    entry that is still within the staleness window is left alone by
+//!    both.
 //!
 //! `CosOrigins::List`'s `Vec<ImmutableOrigin>` doubles as an LRU list:
 //! order *is* the recency signal (front = least-recently-used, back =
@@ -368,6 +386,24 @@ struct CosEntry {
     /// it became `Pending`). Only consulted while `state` is still
     /// `Pending`; see `is_stale_pending` and this module's doc comment.
     pending_since_unix_secs: u64,
+    /// Number of outstanding writers for this entry: handles returned by
+    /// `complete_a_create_request` whose matching `finish_write`/
+    /// `abandon_pending_write` has not yet run. Deliberately not
+    /// persisted (`#[serde(skip)]`, defaulting to `0`) -- a write session
+    /// obtained by a JS handle in a previous process run can never be
+    /// resumed after a restart, so every entry genuinely has zero
+    /// outstanding writers the moment it's loaded from disk.
+    ///
+    /// Only ever consulted while `state` is `Pending` (see
+    /// `finish_write`'s and `abandon_pending_write`'s doc comments): it
+    /// exists so a failed or aborted write can safely decide whether it is
+    /// the *last* outstanding writer for this hash before removing the
+    /// entry, without disturbing a genuinely concurrent sibling write
+    /// (another origin, or the same origin from another handle) that may
+    /// still succeed. An already-`Written` entry is never removed this
+    /// way regardless of this count's value.
+    #[serde(skip)]
+    pending_writer_count: u32,
     /// Seconds since the Unix epoch when this entry was last successfully
     /// read (a `Found` outcome), or written if never read since. Drives
     /// storage-budget eviction order (oldest first); see this module's
@@ -1059,6 +1095,13 @@ impl CrossOriginStorageStore {
     /// awaited this call anyway), and if the abuse continues into an
     /// actual `close()`, that surfaces the real, visible
     /// `NotAllowedError` via `verify_and_store`'s own `RateLimited`.
+    ///
+    /// Unlike `complete_a_read_request`, this has no shared-lock fast
+    /// path: every call, even a no-op-looking repeat for an already-fresh
+    /// entry, has to increment `CosEntry::pending_writer_count` under the
+    /// exclusive lock, since the returned handle is a genuine new
+    /// outstanding writer that `finish_write`/`abandon_pending_write`
+    /// will later need to account for -- see that field's doc comment.
     fn complete_a_create_request(
         &self,
         hash: &CosHash,
@@ -1070,36 +1113,23 @@ impl CrossOriginStorageStore {
         }
 
         let key = registry_key(hash);
-
-        // Fast path: a shared read lock is enough to rule out the
-        // common, idempotent case -- a repeated create() for a hash that
-        // already has a fresh (non-stale) entry -- without ever taking
-        // the exclusive lock; see this module's doc comment on
-        // `Arc<RwLock<..>>`.
-        {
-            let data = self.data.read();
-            if matches!(data.entries.get(&key), Some(existing) if !is_stale_pending(existing)) {
-                return;
-            }
-        }
-
         let normalized = match requested_origins {
             None => CosOrigins::SameSiteOnly,
             Some(RequestedOrigins::Wildcard) => CosOrigins::Wildcard,
             Some(RequestedOrigins::List(origins)) => CosOrigins::List(origins),
         };
 
-        // Slow path: re-decides from scratch under the write lock rather
-        // than trusting the read lock above, for the same
-        // stay-correct-under-real-concurrency reason as
-        // `complete_a_read_request`'s own fast/slow split.
         let mut data = self.data.write();
         // A stale Pending entry from an abandoned write is replaced with
         // a fresh one, same as if the hash had never been requested
         // before; see this module's doc comment. A Written entry, or a
         // Pending one still within the staleness window (an ordinary
         // in-flight write, possibly a genuinely concurrent one from
-        // another origin), is left untouched.
+        // another origin), is left untouched. Either way, the old
+        // entry's `pending_writer_count` (if any) is what it is: a fresh
+        // replacement entry starts that count at `0`, discarding
+        // whatever stale count the abandoned entry had accumulated,
+        // exactly as it discards the rest of that entry's stale state.
         let needs_fresh_entry = match data.entries.get(&key) {
             None => true,
             Some(existing) => is_stale_pending(existing),
@@ -1112,17 +1142,24 @@ impl CrossOriginStorageStore {
                 storing_origins: HashSet::new(),
                 pending_since_unix_secs: unix_now_secs(),
                 last_read_unix_secs: unix_now_secs(),
+                pending_writer_count: 0,
             };
             // Only persisted when something actually changed: unlike
             // `verify_and_store`, a repeated `create()` call for a hash
             // that already has a fresh entry is a legitimate, common,
-            // idempotent no-op (the same handle-obtaining call a page
-            // might make many times for the same hash), and writing an
-            // entry file for it every time would be a real, needless
-            // disk-I/O cost with no corresponding state change to
-            // justify it.
+            // idempotent no-op as far as *disk* state goes (the same
+            // handle-obtaining call a page might make many times for the
+            // same hash), and writing an entry file for it every time
+            // would be a real, needless disk-I/O cost with no
+            // corresponding on-disk state change to justify it --
+            // `pending_writer_count` is deliberately in-memory-only
+            // (`#[serde(skip)]`), so incrementing it below never needs
+            // persisting either.
             self.persist_entry(&key, &entry);
-            data.entries.insert(key, entry);
+            data.entries.insert(key.clone(), entry);
+        }
+        if let Some(entry) = data.entries.get_mut(&key) {
+            entry.pending_writer_count += 1;
         }
     }
 
@@ -1148,11 +1185,22 @@ impl CrossOriginStorageStore {
         // fast/slow split. Only remove it while still Pending: if
         // another origin's write for the same hash already completed (a
         // genuinely concurrent write racing this now-aborted one), that
-        // Written entry must survive this abort.
+        // Written entry must survive this abort. And even while still
+        // Pending, only remove it once this is the *last* outstanding
+        // writer (`pending_writer_count` reaches `0`): a second,
+        // genuinely concurrent writer for the same hash (see
+        // `CosEntry::pending_writer_count`'s doc comment) may still
+        // succeed, and this abort must not remove the entry out from
+        // under it.
         let mut data = self.data.write();
-        if matches!(data.entries.get(&key), Some(entry) if entry.state == CosEntryState::Pending) {
-            data.entries.remove(&key);
-            delete_entry_metadata_file(self.config_dir.as_deref(), &key);
+        if let Some(entry) = data.entries.get_mut(&key) {
+            if entry.state == CosEntryState::Pending {
+                entry.pending_writer_count = entry.pending_writer_count.saturating_sub(1);
+                if entry.pending_writer_count == 0 {
+                    data.entries.remove(&key);
+                    delete_entry_metadata_file(self.config_dir.as_deref(), &key);
+                }
+            }
         }
     }
 
@@ -1253,6 +1301,16 @@ impl CrossOriginStorageStore {
         }
     }
 
+    /// Acquires the write lock and calls
+    /// `decrement_pending_writer_and_maybe_remove`; see that free
+    /// function's doc comment. Used by `finish_write`'s early failure
+    /// branches (`io_failed`, received-byte-count mismatch, digest
+    /// mismatch), none of which otherwise touch `self.data` at all.
+    fn cleanup_failed_write(&self, key: &str) {
+        let mut data = self.data.write();
+        decrement_pending_writer_and_maybe_remove(&mut data, self.config_dir.as_deref(), key);
+    }
+
     /// Finalizes a streamed write; see `CosThreadMsg::FinishWrite`'s doc
     /// comment. <https://wicg.github.io/cross-origin-storage/#verify-and-store>
     fn finish_write(
@@ -1274,6 +1332,12 @@ impl CrossOriginStorageStore {
             io_failed,
         } = session;
 
+        // Computed up front so every failure branch below -- even the
+        // ones that return before ever touching `self.data` otherwise --
+        // can clean up this hash's `pending_writer_count`; see
+        // `cleanup_failed_write`.
+        let key = registry_key(&hash);
+
         // Checked before anything else: if a chunk ever failed to reach
         // disk, `received_bytes` and `hasher` below already reflect it
         // regardless (see `PendingWriteSession::io_failed`'s doc
@@ -1284,6 +1348,7 @@ impl CrossOriginStorageStore {
         // digest the bytes on disk no longer actually match.
         if io_failed {
             discard_staging(&staging);
+            self.cleanup_failed_write(&key);
             return VerifyAndStoreOutcome::HashMismatch;
         }
 
@@ -1295,16 +1360,17 @@ impl CrossOriginStorageStore {
         // against a bug in this implementation's own chunking.
         if received_bytes != declared_total_bytes {
             discard_staging(&staging);
+            self.cleanup_failed_write(&key);
             return VerifyAndStoreOutcome::HashMismatch;
         }
 
         let computed_hex = hex_encode(hasher.finish().as_ref());
         if computed_hex != hash.value.to_ascii_lowercase() {
             discard_staging(&staging);
+            self.cleanup_failed_write(&key);
             return VerifyAndStoreOutcome::HashMismatch;
         }
 
-        let key = registry_key(&hash);
         let new_bytes_len = declared_total_bytes;
 
         // Held for the whole operation below (quota check, eviction, and
@@ -1413,6 +1479,11 @@ impl CrossOriginStorageStore {
                         final_path.display()
                     );
                     let _ = std::fs::remove_file(&temp_path);
+                    // Already holding `data`'s write lock at this point
+                    // (see above), so this calls the free function
+                    // directly rather than `cleanup_failed_write`, which
+                    // would try to acquire it again and deadlock.
+                    decrement_pending_writer_and_maybe_remove(&mut data, self.config_dir.as_deref(), &key);
                     return VerifyAndStoreOutcome::HashMismatch;
                 }
                 match std::fs::read(&final_path) {
@@ -1449,7 +1520,15 @@ impl CrossOriginStorageStore {
                 storing_origins: HashSet::new(),
                 pending_since_unix_secs: unix_now_secs(),
                 last_read_unix_secs: unix_now_secs(),
+                pending_writer_count: 0,
             });
+        // This writer is settling (successfully, in this branch) either
+        // way; see `CosEntry::pending_writer_count`'s doc comment. No
+        // conditional removal check needed here, unlike the failure
+        // branches: `entry.state` is about to become `Written` below
+        // regardless of this count's value, which permanently exempts it
+        // from removal.
+        entry.pending_writer_count = entry.pending_writer_count.saturating_sub(1);
 
         // Captured before overwriting `entry.bytes`/`last_read_unix_secs`/
         // `storing_origins` below, so the running totals (`data.total_bytes`,
@@ -1824,6 +1903,39 @@ fn delete_entry_metadata_file(config_dir: Option<&Path>, key: &str) {
     }
 }
 
+/// Decrements `key`'s `pending_writer_count` and, if this was the last
+/// outstanding writer for a still-`Pending` entry, removes it entirely
+/// (in-memory and, via `delete_entry_metadata_file`, on disk). See
+/// `CosEntry::pending_writer_count`'s doc comment for the full
+/// rationale. A no-op if `key` has no entry, or if it does but is
+/// already `Written` -- a written entry is never removed this way,
+/// regardless of this count's value.
+///
+/// Takes an already-held `&mut CosRegistryData` (rather than acquiring
+/// `self.data.write()` itself) so it can be called both from a context
+/// that still needs to acquire the write lock (`cleanup_failed_write`,
+/// for a failure branch that hasn't touched `data` yet) and from one
+/// that already holds it (the rename-failure branch inside
+/// `finish_write`'s locked region, where acquiring it again would
+/// deadlock).
+fn decrement_pending_writer_and_maybe_remove(
+    data: &mut CosRegistryData,
+    config_dir: Option<&Path>,
+    key: &str,
+) {
+    let Some(entry) = data.entries.get_mut(key) else {
+        return;
+    };
+    if entry.state != CosEntryState::Pending {
+        return;
+    }
+    entry.pending_writer_count = entry.pending_writer_count.saturating_sub(1);
+    if entry.pending_writer_count == 0 {
+        data.entries.remove(key);
+        delete_entry_metadata_file(config_dir, key);
+    }
+}
+
 /// The disk (per `sysinfo`) whose mount point is the longest matching
 /// prefix of `path`, so a nested mount (e.g. a separate partition
 /// mounted under the config directory's ancestry) is preferred over a
@@ -2007,6 +2119,7 @@ mod tests {
             origins: CosOrigins::SameSiteOnly,
             storing_origins,
             pending_since_unix_secs: 0,
+            pending_writer_count: 0,
             last_read_unix_secs,
         }
     }
@@ -2050,6 +2163,75 @@ mod tests {
             store.verify_and_store(&h, b"wrong bytes".to_vec(), "text/plain".to_owned(), writer, None),
             VerifyAndStoreOutcome::HashMismatch
         ));
+    }
+
+    #[test]
+    fn a_hash_mismatched_write_removes_the_entry_it_created_rather_than_leaving_it_pending_forever() {
+        // https://wicg.github.io/cross-origin-storage/#verify-and-store
+        let store = store();
+        let h = hash("SHA-256", &"1".repeat(64));
+        let writer = origin("https://writer.example");
+        let reader = origin("https://reader.example");
+
+        store.complete_a_create_request(&h, &writer, None);
+        assert!(matches!(
+            store.verify_and_store(&h, b"wrong bytes".to_vec(), "text/plain".to_owned(), writer, None),
+            VerifyAndStoreOutcome::HashMismatch
+        ));
+
+        // Gone entirely -- not left behind in a permanently `Pending`
+        // state that would make every future reader see `PendingWrite`
+        // forever, for a hash nobody will ever successfully write.
+        assert!(!store.data.read().entries.contains_key(&registry_key(&h)));
+        assert!(matches!(
+            store.complete_a_read_request(&h, &reader),
+            CosReadOutcome::NotFound
+        ));
+    }
+
+    #[test]
+    fn a_hash_mismatched_write_does_not_remove_a_concurrent_sibling_writes_entry() {
+        // Two "writers" (two separate create requests, simulating two
+        // handles for the same hash -- possibly from two different
+        // origins) race for the same hash; one supplies wrong bytes, the
+        // other correct ones. The failure must not remove the entry out
+        // from under the still-outstanding sibling, regardless of which
+        // one finishes first.
+        let store = store();
+        let bytes = b"correct sibling bytes".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        let failing_writer = origin("https://failing-writer.example");
+        let succeeding_writer = origin("https://succeeding-writer.example");
+
+        store.complete_a_create_request(&h, &failing_writer, None);
+        store.complete_a_create_request(&h, &succeeding_writer, None);
+
+        assert!(matches!(
+            store.verify_and_store(
+                &h,
+                b"wrong bytes entirely".to_vec(),
+                "text/plain".to_owned(),
+                failing_writer,
+                None,
+            ),
+            VerifyAndStoreOutcome::HashMismatch
+        ));
+
+        // The entry must have survived the sibling's failure: still
+        // present and still `Pending` (not yet removed, since the
+        // succeeding writer below is still outstanding).
+        assert!(store.data.read().entries.contains_key(&registry_key(&h)));
+
+        assert!(matches!(
+            store.verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), succeeding_writer.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
+
+        match store.complete_a_read_request(&h, &succeeding_writer) {
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(*found, bytes),
+            other => panic!("expected the surviving sibling write to have succeeded, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2192,6 +2374,7 @@ mod tests {
             origins: CosOrigins::List(vec![a.clone(), b.clone(), c.clone()]),
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            pending_writer_count: 0,
             last_read_unix_secs: 0,
         };
         touch_listed_origin(&mut entry, &b);
@@ -2212,6 +2395,7 @@ mod tests {
             origins: CosOrigins::List(vec![a.clone(), b.clone()]),
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            pending_writer_count: 0,
             last_read_unix_secs: 0,
         };
         touch_listed_origin(&mut entry, &absent);
@@ -2229,6 +2413,7 @@ mod tests {
             origins: CosOrigins::Wildcard,
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            pending_writer_count: 0,
             last_read_unix_secs: 0,
         };
         // Must not panic on a non-`List` entry.
@@ -2361,6 +2546,7 @@ mod tests {
                 origins,
                 storing_origins: HashSet::from([storing_origin.clone()]),
                 pending_since_unix_secs: 0,
+                pending_writer_count: 0,
                 last_read_unix_secs: 0,
             },
         );
@@ -2565,6 +2751,7 @@ mod tests {
             origins: CosOrigins::Wildcard,
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            pending_writer_count: 0,
             last_read_unix_secs: 0,
         };
         for _ in 0..500 {
@@ -2583,6 +2770,7 @@ mod tests {
             origins: CosOrigins::Wildcard,
             storing_origins: HashSet::new(),
             pending_since_unix_secs: 0,
+            pending_writer_count: 0,
             last_read_unix_secs: 0,
         };
         let trials = 3000;
@@ -2848,6 +3036,36 @@ mod tests {
         match store.complete_a_read_request(&h, &writer) {
             CosReadOutcome::Found { bytes: found, .. } => assert_eq!(*found, bytes),
             other => panic!("expected the written entry to survive, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn abandon_pending_write_does_not_remove_a_concurrent_sibling_writes_entry() {
+        // The same race as `a_hash_mismatched_write_does_not_remove_a_concurrent_sibling_writes_entry`,
+        // but the failing writer aborts instead of closing with wrong
+        // bytes. Must not remove the entry out from under the still-
+        // outstanding sibling.
+        let store = store();
+        let bytes = b"correct sibling bytes via abort race".to_vec();
+        let computed = compute_hex_digest("SHA-256", &bytes).unwrap();
+        let h = hash("SHA-256", &computed);
+        let aborting_writer = origin("https://aborting-writer.example");
+        let succeeding_writer = origin("https://succeeding-writer.example");
+
+        store.complete_a_create_request(&h, &aborting_writer, None);
+        store.complete_a_create_request(&h, &succeeding_writer, None);
+
+        store.abandon_pending_write(&h);
+        assert!(store.data.read().entries.contains_key(&registry_key(&h)));
+
+        assert!(matches!(
+            store.verify_and_store(&h, bytes.clone(), "text/plain".to_owned(), succeeding_writer.clone(), None),
+            VerifyAndStoreOutcome::Success
+        ));
+
+        match store.complete_a_read_request(&h, &succeeding_writer) {
+            CosReadOutcome::Found { bytes: found, .. } => assert_eq!(*found, bytes),
+            other => panic!("expected the surviving sibling write to have succeeded, got {other:?}"),
         }
     }
 

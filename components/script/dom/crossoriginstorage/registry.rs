@@ -315,9 +315,12 @@ impl CosVerifyAndStoreResponseHandler {
                 match outcome {
                     VerifyAndStoreOutcome::Success => promise.resolve_native(cx, &()),
                     // Step 2 of verify-and-store: reject with DataError on
-                    // hash mismatch, leaving the entry unmodified (nothing
-                    // to roll back: the registry is only ever mutated on
-                    // the success path).
+                    // hash mismatch. The resource thread separately cleans
+                    // up the entry this write was for, once no other
+                    // outstanding writer for the same hash remains -- see
+                    // net::cross_origin_storage_thread's
+                    // `decrement_pending_writer_and_maybe_remove`; nothing
+                    // for script to roll back here either way.
                     VerifyAndStoreOutcome::HashMismatch => promise.reject_error(cx, Error::Data(None)),
                     // This implementation's write-probe rate limit (see
                     // net::cross_origin_storage_thread's doc comment);
