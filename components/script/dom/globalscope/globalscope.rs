@@ -167,11 +167,12 @@ pub(crate) struct AutoCloseWorker {
     /// <https://html.spec.whatwg.org/multipage/#dom-workerglobalscope-closing>
     #[conditional_malloc_size_of]
     closing: Arc<AtomicBool>,
+    #[conditional_malloc_size_of]
+    animation_frame_provider_supported: Arc<AtomicBool>,
     /// A handle to join on the worker thread.
     #[ignore_malloc_size_of = "JoinHandle"]
     join_handle: Option<JoinHandle<()>>,
-    /// A sender of control messages,
-    /// currently only used to signal shutdown.
+    /// A sender of control messages.
     #[no_trace]
     control_sender: Sender<DedicatedWorkerControlMsg>,
     /// The context to request an interrupt on the worker thread.
@@ -2315,6 +2316,7 @@ impl GlobalScope {
     pub(crate) fn track_worker(
         &self,
         closing: Arc<AtomicBool>,
+        animation_frame_provider_supported: Arc<AtomicBool>,
         join_handle: JoinHandle<()>,
         control_sender: Sender<DedicatedWorkerControlMsg>,
         context: ThreadSafeJSContext,
@@ -2323,10 +2325,22 @@ impl GlobalScope {
             .borrow_mut()
             .push(AutoCloseWorker {
                 closing,
+                animation_frame_provider_supported,
                 join_handle: Some(join_handle),
                 control_sender,
                 context,
             });
+    }
+
+    pub(crate) fn disable_owned_worker_animation_frame_providers(&self) {
+        for worker in &*self.list_auto_close_worker.borrow() {
+            worker
+                .animation_frame_provider_supported
+                .store(false, Ordering::SeqCst);
+            let _ = worker
+                .control_sender
+                .send(DedicatedWorkerControlMsg::AnimationFrameProviderUnsupported);
+        }
     }
 
     pub(crate) fn track_event_source(&self, event_source: &EventSource) {
@@ -2928,6 +2942,8 @@ impl GlobalScope {
             worker.task_manager()
         } else if let Some(window) = self.downcast::<Window>() {
             window.task_manager()
+        } else if let Some(worklet) = self.downcast::<WorkletGlobalScope>() {
+            worklet.task_manager()
         } else {
             unreachable!("Attempted to use task manager with unsupported global");
         }
@@ -3082,6 +3098,8 @@ impl GlobalScope {
             window.perform_a_microtask_checkpoint(cx);
         } else if let Some(worker) = self.downcast::<WorkerGlobalScope>() {
             worker.perform_a_microtask_checkpoint(cx);
+        } else if let Some(worklet) = self.downcast::<WorkletGlobalScope>() {
+            worklet.perform_a_microtask_checkpoint(cx);
         }
     }
 
