@@ -3,6 +3,7 @@
  * file, You can obtain one at https://mozilla.org/MPL/2.0/. */
 
 use std::cell::{Cell, RefCell};
+use std::io::{Seek, SeekFrom, Write};
 use std::ptr;
 use std::rc::Rc;
 
@@ -277,7 +278,7 @@ impl Callback for WriteAlgorithmRejectionHandler {
 }
 
 /// The type of sink algorithms we are using.
-#[derive(JSTraceable, PartialEq)]
+#[derive(JSTraceable)]
 #[cfg_attr(crown, crown::unrooted_must_root_lint::must_root)]
 pub enum UnderlyingSinkType {
     /// Algorithms are provided by Js callbacks.
@@ -311,14 +312,26 @@ pub enum UnderlyingSinkType {
     CrossOriginStorageWrite {
         #[no_trace]
         hash: crate::dom::crossoriginstorage::hash::CosHash,
-        #[no_trace = "Vec<u8> and RefCell hold no JS-managed data"]
-        bytes: RefCell<Vec<u8>>,
+        /// The sink's scratch storage: a real, disk-backed temp file, not
+        /// an in-memory buffer -- this is what lets `seek()`/`truncate()`
+        /// perform genuine random-access edits without holding the
+        /// write's full content (this feature targets multi-GB payloads)
+        /// resident in script-process memory. Created via
+        /// `tempfile::tempfile()`, which on Unix unlinks the file the
+        /// moment it's created, so its disk space is reclaimed the moment
+        /// every handle to it closes -- including on a crash, with no
+        /// separate cleanup pass needed. `Option` so `close()`/`abort()`
+        /// can `take()` it: exactly one of them ever runs, and each needs
+        /// to consume the file (to read it back, or to drop/discard it)
+        /// rather than merely borrow it.
+        #[no_trace = "File, RefCell, and Option hold no JS-managed data"]
+        file: RefCell<Option<std::fs::File>>,
         /// The stream's `[[position]]` slot
         /// (<https://fs.spec.whatwg.org/#filesystemwritablefilestream>):
-        /// where the next `write()` lands in `bytes`, advanced by each
+        /// where the next `write()` lands in the file, advanced by each
         /// write's length and settable directly by `seek()`. Writing past
-        /// the current end of `bytes` zero-pads the gap, matching a real
-        /// file's semantics.
+        /// the current end of the file zero-pads the gap for free, via
+        /// ordinary OS file semantics.
         #[no_trace = "Cell<usize> holds no JS-managed data"]
         position: Cell<usize>,
         #[no_trace = "String holds no JS-managed data"]
@@ -380,35 +393,34 @@ pub struct WritableStreamDefaultController {
     abort_controller: Dom<AbortController>,
 }
 
-/// Hard ceiling on a single Cross-Origin Storage write buffer's size, in
-/// bytes: enforced by `write_chunk_at_position` and `apply_write_params`'s
-/// `"truncate"` command before ever calling `Vec::resize`. Without this, a
-/// page could call `truncate(hugeNumber)` (or `seek(hugeNumber)` followed
-/// by any `write()`) and have this sink attempt to allocate and
-/// zero-fill an arbitrarily large buffer immediately -- an out-of-memory
-/// denial of service reachable from a single script call, well before
-/// `close()`'s registry-side storage-budget check
-/// (`net::cross_origin_storage_thread::verify_and_store`) ever gets a
-/// chance to reject anything. Not spec-mandated (the File System
+/// Hard ceiling on a single Cross-Origin Storage write session's temp-file
+/// size, in bytes: enforced by `write_chunk_at_position` and
+/// `apply_write_params`'s `"truncate"` command before ever growing the
+/// file. Without this, a page could call `truncate(hugeNumber)` (or
+/// `seek(hugeNumber)` followed by any `write()`) and claim an arbitrarily
+/// large amount of disk space immediately -- reachable from a single
+/// script call, well before `close()`'s registry-side storage-budget
+/// check (`net::cross_origin_storage_thread::verify_and_store`) ever gets
+/// a chance to reject anything. Not spec-mandated (the File System
 /// Standard has no numeric ceiling here either): chosen well above any
 /// real individual file this feature's own budget constants are sized
 /// around (see `net::cross_origin_storage_thread`'s
 /// `PROBE_BUDGET_CAPACITY` doc comment: ~25 MiB sharded-AI-model chunks),
-/// while still bounding how much memory a single allocation attempt can
-/// ever demand.
-const MAX_COS_WRITE_BUFFER_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
+/// while still bounding how much disk space a single streaming session
+/// can claim ahead of the real budget check.
+const MAX_COS_WRITE_FILE_BYTES: usize = 4 * 1024 * 1024 * 1024; // 4 GiB
 
 /// Rejects `promise` with a `QuotaExceededError` and returns `true` if
 /// `target` (a prospective new size for a `CrossOriginStorageWrite`
-/// sink's buffer) exceeds `MAX_COS_WRITE_BUFFER_BYTES`, without ever
-/// calling `Vec::resize`; see that constant's doc comment. Callers must
-/// check this *before* resizing, not after.
+/// sink's temp file) exceeds `MAX_COS_WRITE_FILE_BYTES`, without ever
+/// growing the file; see that constant's doc comment. Callers must check
+/// this *before* writing/truncating, not after.
 fn reject_if_write_target_too_large(cx: &mut JSContext, promise: &Rc<Promise>, target: usize) -> bool {
-    if target > MAX_COS_WRITE_BUFFER_BYTES {
+    if target > MAX_COS_WRITE_FILE_BYTES {
         promise.reject_error(
             cx,
             Error::QuotaExceeded {
-                quota: Some(Finite::wrap(MAX_COS_WRITE_BUFFER_BYTES as f64)),
+                quota: Some(Finite::wrap(MAX_COS_WRITE_FILE_BYTES as f64)),
                 requested: Some(Finite::wrap(target as f64)),
             },
         );
@@ -417,17 +429,19 @@ fn reject_if_write_target_too_large(cx: &mut JSContext, promise: &Rc<Promise>, t
     false
 }
 
-/// Writes `chunk_bytes` into `bytes` at `position`'s current value,
-/// zero-padding first if that lands past the current end (matching a real
-/// file's semantics), then advances `position` by `chunk_bytes.len()`.
-/// Shared by every chunk type (`ArrayBuffer`/`ArrayBufferView`, `Blob`,
-/// `USVString`) `CrossOriginStorageWrite`'s write algorithm accepts.
-/// Rejects `promise` and returns `false` without writing anything if the
-/// resulting buffer size would exceed `MAX_COS_WRITE_BUFFER_BYTES`.
+/// Writes `chunk_bytes` into `file` at `position`'s current value, then
+/// advances `position` by `chunk_bytes.len()`. Writing past the file's
+/// current end zero-pads the gap for free -- ordinary OS file semantics,
+/// not something this function has to implement itself. Shared by every
+/// chunk type (`ArrayBuffer`/`ArrayBufferView`, `Blob`, `USVString`)
+/// `CrossOriginStorageWrite`'s write algorithm accepts. Rejects `promise`
+/// and returns `false` without writing anything if the resulting file
+/// size would exceed `MAX_COS_WRITE_FILE_BYTES`, or if the write itself
+/// fails (e.g. the disk is full).
 fn write_chunk_at_position(
     cx: &mut JSContext,
     promise: &Rc<Promise>,
-    bytes: &RefCell<Vec<u8>>,
+    file: &RefCell<Option<std::fs::File>>,
     position: &Cell<usize>,
     chunk_bytes: &[u8],
 ) -> bool {
@@ -436,19 +450,29 @@ fn write_chunk_at_position(
     if reject_if_write_target_too_large(cx, promise, end) {
         return false;
     }
-    let mut buf = bytes.borrow_mut();
-    if end > buf.len() {
-        buf.resize(end, 0);
+    let mut file = file.borrow_mut();
+    let file = file
+        .as_mut()
+        .expect("write algorithm invoked after the temp file was already taken by close()/abort()");
+    let write_result = file
+        .seek(SeekFrom::Start(start as u64))
+        .and_then(|_| file.write_all(chunk_bytes));
+    if let Err(error) = write_result {
+        promise.reject_error(
+            cx,
+            Error::Operation(Some(format!(
+                "Failed to write to the Cross-Origin Storage temp file: {error}"
+            ))),
+        );
+        return false;
     }
-    buf[start..end].copy_from_slice(chunk_bytes);
-    drop(buf);
     position.set(end);
     true
 }
 
 /// Parses `value` as `ArrayBuffer`/`ArrayBufferView`, `Blob`, or
 /// `USVString` -- the three "plain data" chunk types -- and writes its
-/// bytes at `position` in `bytes`, settling `promise` accordingly. Shared
+/// bytes at `position` in `file`, settling `promise` accordingly. Shared
 /// by a bare `write()` chunk and by a `WriteParams` dictionary's
 /// `"write"` command's `data` member, which both accept exactly these
 /// three types (see
@@ -457,21 +481,21 @@ fn write_plain_data_chunk(
     cx: &mut JSContext,
     promise: &Rc<Promise>,
     value: SafeHandleValue,
-    bytes: &RefCell<Vec<u8>>,
+    file: &RefCell<Option<std::fs::File>>,
     position: &Cell<usize>,
 ) {
     match ArrayBufferViewOrArrayBuffer::safe_from_jsval(cx, value, ()) {
         Ok(ConversionResult::Success(buffer_source)) => {
             let chunk_bytes =
                 get_buffer_source_copy(ArrayBufferViewOrArrayBufferRef::from(&buffer_source));
-            if write_chunk_at_position(cx, promise, bytes, position, &chunk_bytes) {
+            if write_chunk_at_position(cx, promise, file, position, &chunk_bytes) {
                 promise.resolve_native(cx, &());
             }
         },
         Ok(ConversionResult::Failure(_)) => match root_from_handlevalue::<Blob>(cx, value) {
             Ok(blob) => match blob.get_bytes() {
                 Ok(blob_bytes) => {
-                    if write_chunk_at_position(cx, promise, bytes, position, &blob_bytes) {
+                    if write_chunk_at_position(cx, promise, file, position, &blob_bytes) {
                         promise.resolve_native(cx, &());
                     }
                 },
@@ -484,7 +508,7 @@ fn write_plain_data_chunk(
             },
             Err(()) => match USVString::safe_from_jsval(cx, value, ()) {
                 Ok(ConversionResult::Success(USVString(text))) => {
-                    if write_chunk_at_position(cx, promise, bytes, position, text.as_bytes()) {
+                    if write_chunk_at_position(cx, promise, file, position, text.as_bytes()) {
                         promise.resolve_native(cx, &());
                     }
                 },
@@ -509,25 +533,25 @@ fn write_plain_data_chunk(
     }
 }
 
-/// Applies a `WriteParams` chunk's `type` command to `bytes`/`position`,
+/// Applies a `WriteParams` chunk's `type` command to `file`/`position`,
 /// per <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-write>:
 /// - `"seek"`: `position` is required; sets `[[position]]` directly (same
 ///   effect as `FileSystemWritableFileStream.seek()`).
-/// - `"truncate"`: `size` is required; resizes `bytes`, clamping
-///   `[[position]]` down if it now exceeds the new size (same effect as
-///   `FileSystemWritableFileStream.truncate()`); rejected with
+/// - `"truncate"`: `size` is required; resizes `file` via `set_len`,
+///   clamping `[[position]]` down if it now exceeds the new size (same
+///   effect as `FileSystemWritableFileStream.truncate()`); rejected with
 ///   `QuotaExceededError` instead if `size` exceeds
-///   `MAX_COS_WRITE_BUFFER_BYTES`, without ever resizing anything -- see
+///   `MAX_COS_WRITE_FILE_BYTES`, without ever resizing anything -- see
 ///   that constant's doc comment.
 /// - `"write"`: `data` is required (`ArrayBuffer`/`ArrayBufferView`/
 ///   `Blob`/`USVString`); if `position` is also given, seeks there first
 ///   (a one-shot positioned write), then writes `data` at `[[position]]`
 ///   and advances it, same as a bare chunk would (also subject to
-///   `MAX_COS_WRITE_BUFFER_BYTES`, via `write_chunk_at_position`).
+///   `MAX_COS_WRITE_FILE_BYTES`, via `write_chunk_at_position`).
 fn apply_write_params(
     cx: &mut JSContext,
     promise: &Rc<Promise>,
-    bytes: &RefCell<Vec<u8>>,
+    file: &RefCell<Option<std::fs::File>>,
     position: &Cell<usize>,
     params: &WriteParams,
 ) {
@@ -550,7 +574,22 @@ fn apply_write_params(
                 if reject_if_write_target_too_large(cx, promise, size) {
                     return;
                 }
-                bytes.borrow_mut().resize(size, 0);
+                let set_len_result = file
+                    .borrow_mut()
+                    .as_mut()
+                    .expect(
+                        "write algorithm invoked after the temp file was already taken by close()/abort()",
+                    )
+                    .set_len(size as u64);
+                if let Err(error) = set_len_result {
+                    promise.reject_error(
+                        cx,
+                        Error::Operation(Some(format!(
+                            "Failed to truncate the Cross-Origin Storage temp file: {error}"
+                        ))),
+                    );
+                    return;
+                }
                 if position.get() > size {
                     position.set(size);
                 }
@@ -575,7 +614,7 @@ fn apply_write_params(
             if let Some(Some(target)) = params.position {
                 position.set(target as usize);
             }
-            write_plain_data_chunk(cx, promise, data.handle(), bytes, position);
+            write_plain_data_chunk(cx, promise, data.handle(), file, position);
         },
     }
 }
@@ -878,15 +917,17 @@ impl WritableStreamDefaultController {
                     .transform_stream_default_sink_abort_algorithm(cx, global, reason)
                     .expect("Transform stream default sink abort algorithm should not fail.")
             },
-            UnderlyingSinkType::CrossOriginStorageWrite { hash, bytes, .. } => {
-                // Discard accumulated bytes; verify_and_store is
-                // deliberately not called on abort, so no entry is
-                // written. `complete a create request` (see
+            UnderlyingSinkType::CrossOriginStorageWrite { hash, file, .. } => {
+                // Drop the temp file: verify_and_store is deliberately not
+                // called on abort, so no entry is written, and dropping
+                // the file (rather than waiting for the controller itself
+                // to be garbage-collected) reclaims its disk space right
+                // away. `complete a create request` (see
                 // crossoriginstoragemanager.rs) already created a Pending
                 // registry entry for this hash, though, so tell the
                 // registry to remove it now rather than leaving it
                 // dangling until its staleness timeout elapses.
-                bytes.borrow_mut().clear();
+                file.borrow_mut().take();
                 crate::dom::crossoriginstorage::registry::abandon_pending_write(global, hash);
                 Promise::new_resolved(cx, global, ())
             },
@@ -974,7 +1015,7 @@ impl WritableStreamDefaultController {
                     .transform_stream_default_sink_write_algorithm(cx, global, chunk)
                     .expect("Transform stream default sink write algorithm should not fail.")
             },
-            UnderlyingSinkType::CrossOriginStorageWrite { bytes, position, .. } => {
+            UnderlyingSinkType::CrossOriginStorageWrite { file, position, .. } => {
                 // <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-write>
                 // covers the full real union type (ArrayBuffer,
                 // ArrayBufferView, Blob, USVString, WriteParams).
@@ -1004,7 +1045,7 @@ impl WritableStreamDefaultController {
                         let chunk_bytes = get_buffer_source_copy(
                             ArrayBufferViewOrArrayBufferRef::from(&buffer_source),
                         );
-                        if write_chunk_at_position(cx, &promise, bytes, position, &chunk_bytes) {
+                        if write_chunk_at_position(cx, &promise, file, position, &chunk_bytes) {
                             promise.resolve_native(cx, &());
                         }
                     },
@@ -1012,7 +1053,7 @@ impl WritableStreamDefaultController {
                     {
                         Ok(blob) => match blob.get_bytes() {
                             Ok(blob_bytes) => {
-                                if write_chunk_at_position(cx, &promise, bytes, position, &blob_bytes) {
+                                if write_chunk_at_position(cx, &promise, file, position, &blob_bytes) {
                                     promise.resolve_native(cx, &());
                                 }
                             },
@@ -1025,10 +1066,10 @@ impl WritableStreamDefaultController {
                         },
                         Err(()) => match WriteParams::new(cx, chunk) {
                             Ok(ConversionResult::Success(params)) => {
-                                apply_write_params(cx, &promise, bytes, position, &params);
+                                apply_write_params(cx, &promise, file, position, &params);
                             },
                             Ok(ConversionResult::Failure(_)) => {
-                                write_plain_data_chunk(cx, &promise, chunk, bytes, position);
+                                write_plain_data_chunk(cx, &promise, chunk, file, position);
                             },
                             Err(()) => {
                                 promise.reject_error(cx, Error::JSFailed);
@@ -1090,7 +1131,7 @@ impl WritableStreamDefaultController {
             },
             UnderlyingSinkType::CrossOriginStorageWrite {
                 hash,
-                bytes,
+                file,
                 type_string,
                 origin,
                 requested_origins,
@@ -1102,13 +1143,22 @@ impl WritableStreamDefaultController {
                 // the time it takes to write the bytes to disk) rather
                 // than blocking this script thread on it; see
                 // `registry.rs`'s doc comment for why that matters.
+                //
+                // `close()` -- unlike `write()`/`seek()`/`truncate()` --
+                // only ever runs once per stream, so `take()`ing the file
+                // here (rather than merely borrowing it) is correct: there
+                // is no further write algorithm invocation left to need
+                // it, and ownership needs to move into `verify_and_store`
+                // for it to read the final content back and stream it on.
                 let promise = Promise::new(cx, global);
-                let written_bytes = bytes.borrow_mut().split_off(0);
+                let written_file = file.borrow_mut().take().expect(
+                    "close algorithm invoked after the temp file was already taken by an earlier close()/abort()",
+                );
                 let requested = requested_origins.borrow_mut().take();
                 crate::dom::crossoriginstorage::registry::verify_and_store(
                     global,
                     hash,
-                    written_bytes,
+                    written_file,
                     type_string.clone(),
                     origin.clone(),
                     requested,

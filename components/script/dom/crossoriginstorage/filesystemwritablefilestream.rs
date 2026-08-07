@@ -34,12 +34,14 @@
 //!
 //! `seek()` and `truncate()` are both real: per
 //! <https://fs.spec.whatwg.org/#filesystemwritablefilestream> the sink
-//! tracks a `[[position]]` slot into the accumulated write buffer.
+//! tracks a `[[position]]` slot into a real, disk-backed temp file (see
+//! `UnderlyingSinkType::CrossOriginStorageWrite`'s `file` field).
 //! `write()` writes at the current position and advances it;
 //! `seek()` sets the position directly (a later `write()` past the
-//! current end of the buffer zero-pads the gap, matching the spec's
-//! "write command" algorithm); `truncate()` resizes the buffer and
-//! clamps the position down if it now exceeds the new size. Per
+//! current end of the file zero-pads the gap for free, via ordinary OS
+//! file semantics, matching the spec's "write command" algorithm);
+//! `truncate()` resizes the file and clamps the position down if it now
+//! exceeds the new size. Per
 //! <https://fs.spec.whatwg.org/#dom-filesystemwritablefilestream-seek>
 //! and `-truncate`, both are defined the same way as `write()`: acquire a
 //! writer, write a `WriteParams`-shaped chunk (`{type, position}` /
@@ -64,7 +66,7 @@ use crate::dom::bindings::codegen::Bindings::FileSystemWritableFileStreamBinding
     FileSystemWritableFileStreamMethods, WriteCommandType, WriteParams,
 };
 use crate::dom::bindings::codegen::Bindings::QueuingStrategyBinding::QueuingStrategy;
-use crate::dom::bindings::error::Fallible;
+use crate::dom::bindings::error::{Error, Fallible};
 use crate::dom::bindings::root::DomRoot;
 use crate::dom::bindings::trace::RootedTraceableBox;
 use crate::dom::crossoriginstorage::hash::CosHash;
@@ -104,6 +106,20 @@ impl FileSystemWritableFileStream {
         origin: ImmutableOrigin,
         requested_origins: Option<RequestedOrigins>,
     ) -> Fallible<DomRoot<FileSystemWritableFileStream>> {
+        // A real, disk-backed scratch file, not an in-memory buffer: lets
+        // `seek()`/`truncate()` perform genuine random-access edits
+        // without holding this write's full content -- this feature
+        // targets multi-GB payloads -- resident in script-process memory.
+        // `tempfile::tempfile()` unlinks the file on creation (on
+        // platforms that support it), so its disk space is reclaimed the
+        // moment every handle to it closes, including on a crash, with no
+        // separate cleanup pass ever needed.
+        let file = tempfile::tempfile().map_err(|error| {
+            Error::Operation(Some(format!(
+                "Failed to create a Cross-Origin Storage temp file: {error}"
+            )))
+        })?;
+
         let this = reflect_dom_object_with_cx(
             Box::new(FileSystemWritableFileStream::new_inherited()),
             global,
@@ -134,7 +150,7 @@ impl FileSystemWritableFileStream {
             size_algorithm,
             UnderlyingSinkType::CrossOriginStorageWrite {
                 hash,
-                bytes: RefCell::new(Vec::new()),
+                file: RefCell::new(Some(file)),
                 position: Cell::new(0),
                 type_string: String::new(),
                 origin,

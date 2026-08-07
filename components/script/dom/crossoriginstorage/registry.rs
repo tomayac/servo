@@ -27,13 +27,20 @@
 //!
 //! This matters because a Worker has only one script thread: blocking it
 //! for the duration of an IPC round-trip (which, for `verify_and_store`,
-//! includes writing the written bytes to disk) freezes that worker
-//! entirely, with nothing else able to run concurrently. On a Window, the
-//! same kind of block also freezes scroll input handling, since Servo's
-//! desktop port dispatches wheel events through a synchronous,
-//! cancelable-by-script `wheel` DOM event with no timeout fallback: any
-//! long blocking script-thread call freezes scrolling along with it.
+//! includes the resource thread writing the verified content to its own
+//! disk-backed registry storage) freezes that worker entirely, with
+//! nothing else able to run concurrently. On a Window, the same kind of
+//! block also freezes scroll input handling, since Servo's desktop port
+//! dispatches wheel events through a synchronous, cancelable-by-script
+//! `wheel` DOM event with no timeout fallback: any long blocking
+//! script-thread call freezes scrolling along with it. `verify_and_store`
+//! does still do one bounded piece of synchronous work on the script
+//! thread itself -- reading `FileSystemWritableFileStream`'s own scratch
+//! file back, one `WRITE_CHUNK_BYTES` piece at a time -- but each `send`
+//! it makes along the way is non-blocking, and the actual registry-side
+//! disk write happens entirely on the resource thread.
 
+use std::io::{Read, Seek};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -341,34 +348,40 @@ impl CosVerifyAndStoreResponseHandler {
     }
 }
 
-/// Chunk size `verify_and_store` splits `bytes` into for the `WriteChunk`
+/// Chunk size `verify_and_store` reads `file` in for the `WriteChunk`
 /// messages that follow `BeginWrite`; see `CosThreadMsg`'s doc comment for
 /// why the resource thread wants this streamed rather than sent as one
 /// message. Not a correctness-relevant value -- just small enough that a
 /// multi-hundred-MiB write doesn't turn into one multi-hundred-MiB IPC
 /// message (defeating the point), and large enough that a large write
-/// doesn't turn into an excessive number of tiny ones.
+/// doesn't turn into an excessive number of tiny ones. Also bounds how
+/// much of `file`'s content is ever resident in script-process memory at
+/// once while reading it back below.
 const WRITE_CHUNK_BYTES: usize = 1024 * 1024;
 
 /// <https://wicg.github.io/cross-origin-storage/#verify-and-store>
 ///
 /// Resolves `promise` with `undefined` on success; rejects per
 /// `VerifyAndStoreOutcome`'s doc comment (`DataError` on hash mismatch,
-/// or if the request could not be sent/answered at all -- this does not
-/// currently distinguish "verification failed" from "could not verify";
+/// or if the request could not be sent/answered at all, including a local
+/// failure to read `file` back -- this does not currently distinguish
+/// "verification failed" from "could not verify";
 /// `NotAllowedError`/`QuotaExceededError` for this implementation's own
 /// rate-limit/storage-budget additions).
 ///
-/// Sends `bytes` to the resource thread as a `BeginWrite` followed by one
+/// `file` is `FileSystemWritableFileStream`'s own disk-backed scratch
+/// file, holding the write's final, fully-resolved content (every
+/// `write()`/`seek()`/`truncate()` already applied). Rewound and read
+/// back here exactly once, in `WRITE_CHUNK_BYTES` pieces, each handed to
+/// the resource thread as a `WriteChunk` immediately -- so this function
+/// never holds more than one chunk of `file`'s content in memory at a
+/// time, however large the write. Sent as a `BeginWrite` followed by one
 /// or more `WriteChunk`s and a final `FinishWrite`, per `CosThreadMsg`'s
-/// doc comment, all tagged with a single random `WriteSessionId` --
-/// `bytes` itself is still fully assembled here in script first (see that
-/// doc comment for why), so this only streams the resource-thread side of
-/// the transfer, not script's own memory use.
+/// doc comment, all tagged with a single random `WriteSessionId`.
 pub(crate) fn verify_and_store(
     global: &GlobalScope,
     hash: &CosHash,
-    bytes: Vec<u8>,
+    mut file: std::fs::File,
     type_string: String,
     origin: ImmutableOrigin,
     requested_origins: Option<RequestedOrigins>,
@@ -385,27 +398,61 @@ pub(crate) fn verify_and_store(
     let session_id = WriteSessionId(rand::random());
     let resource_threads = global.resource_threads();
 
-    let mut sent = resource_threads.send(CoreResourceMsg::ToCrossOriginStorage(
-        CosThreadMsg::BeginWrite(session_id, hash.clone(), origin.clone(), bytes.len() as u64),
-    ));
-    if sent.is_ok() {
-        for chunk in bytes.chunks(WRITE_CHUNK_BYTES) {
-            sent = resource_threads.send(CoreResourceMsg::ToCrossOriginStorage(
-                CosThreadMsg::WriteChunk(session_id, chunk.to_vec()),
-            ));
-            if sent.is_err() {
-                break;
+    // A local read failure here (an unlikely, but real, possibility --
+    // the temp file could in principle be on a volume that went away)
+    // reuses the same fallback as an IPC send failure below: no
+    // `FinishWrite` is ever sent, and the callback is invoked locally
+    // with the same generic failure outcome. The resource thread's own
+    // stale-session cleanup reclaims the never-finished `BeginWrite`
+    // session on the other end either way.
+    let mut ok = match (file.metadata(), file.rewind()) {
+        (Ok(metadata), Ok(())) => resource_threads
+            .send(CoreResourceMsg::ToCrossOriginStorage(CosThreadMsg::BeginWrite(
+                session_id,
+                hash.clone(),
+                origin.clone(),
+                metadata.len(),
+            )))
+            .is_ok(),
+        _ => false,
+    };
+
+    if ok {
+        let mut buffer = vec![0u8; WRITE_CHUNK_BYTES];
+        loop {
+            match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    ok = resource_threads
+                        .send(CoreResourceMsg::ToCrossOriginStorage(CosThreadMsg::WriteChunk(
+                            session_id,
+                            buffer[..read].to_vec(),
+                        )))
+                        .is_ok();
+                    if !ok {
+                        break;
+                    }
+                },
+                Err(_) => {
+                    ok = false;
+                    break;
+                },
             }
         }
     }
-    if sent.is_ok() {
-        sent = resource_threads.send(CoreResourceMsg::ToCrossOriginStorage(
-            CosThreadMsg::FinishWrite(session_id, type_string, requested_origins, callback.clone()),
-        ));
+
+    if ok {
+        ok = resource_threads
+            .send(CoreResourceMsg::ToCrossOriginStorage(CosThreadMsg::FinishWrite(
+                session_id,
+                type_string,
+                requested_origins,
+                callback.clone(),
+            )))
+            .is_ok();
     }
-    if sent.is_err() &&
-        let Err(error) = callback.send(VerifyAndStoreOutcome::HashMismatch)
-    {
+
+    if !ok && let Err(error) = callback.send(VerifyAndStoreOutcome::HashMismatch) {
         error!("Failed to deliver Cross-Origin Storage verify-and-store response: {error}");
     }
 }
